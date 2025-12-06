@@ -171,10 +171,10 @@ RESET:
     lda #$02
     sta intensity
 
-    ; Initialize APU for HARD TECHNO - DISABLED FOR TESTING
+    ; Initialize APU - DISABLED FOR TESTING
     ; jsr init_audio
-    lda #$00                ; Silence all channels
-    sta APU_STATUS
+    lda #$00
+    sta APU_STATUS          ; Silence everything
     
     ; Load initial palette
     jsr load_palette
@@ -247,15 +247,8 @@ NMI:
     sta current_mode
     
 @same_mode:
-    ; Show current mode number (0-F) in top-left tile for debug
-    bit PPU_STATUS
-    lda #$20
-    sta PPU_ADDR
-    lda #$00
-    sta PPU_ADDR
-    lda current_mode
-    ora #$10                ; Tile $10-$1F based on mode
-    sta PPU_DATA
+    ; ALL AUDIO DISABLED FOR TESTING
+    ; jsr update_music
 
     ; Update palette
     jsr update_palette
@@ -383,22 +376,15 @@ update_music_simple:
     rts
 
 ;------------------------------------------------------------------------------
-; FULL Update Music - HARD TECHNO ENGINE (disabled for debug)
+; FULL Update Music - HARD TECHNO ENGINE
 ;------------------------------------------------------------------------------
 update_music:
-    ; Safety: ensure beat_timer is valid (1-30)
-    lda beat_timer
-    beq @reset_timer        ; If 0, reset it
-    cmp #31
-    bcs @reset_timer        ; If > 30, corrupted, reset it
-    
-    ; Decrement beat timer
+    ; Simple beat timer countdown
     dec beat_timer
     bne @no_beat
     
-@reset_timer:
-    ; New beat! Reset timer
-    lda #8                  ; ~130 BPM (constant, simpler)
+    ; Beat hit 0 - reset and play beat
+    lda #8                  ; ~130 BPM
     sta beat_timer
     
     ; Advance beat count
@@ -418,33 +404,26 @@ update_music:
     and #$07
     cmp #$06
     bcc @no_intensity_change
-    ; Build up intensity every 8 bars
     inc intensity
     lda intensity
     cmp #$05
     bcc @no_intensity_change
-    lda #$01                ; Reset to low intensity
+    lda #$01
     sta intensity
 @no_intensity_change:
 
 @same_bar:
-    ; Play beat elements based on beat_count
+    ; Play beat elements (lead disabled for testing)
     jsr play_kick
     jsr play_snare
     jsr play_bass
-    jsr play_lead
+    ; jsr play_lead
     
 @no_beat:
     ; Update ongoing sounds (decay)
     jsr update_kick_decay
     jsr update_snare_decay
-    jsr update_lead_decay
-    
-    ; Update arpeggio (runs faster than beat)
-    jsr update_arpeggio
-    
-    ; Update hi-hat
-    jsr update_hihat
+    ; jsr update_lead_decay  ; disabled with lead
     
     rts
 
@@ -515,16 +494,15 @@ play_snare:
     bne @no_snare
     
 @play:
-    ; Snare - noise with high pitch
-    lda #%00111111          ; No envelope, vol 15
+    ; Snare - noise burst (no metallic mode!)
+    lda #%00111100          ; Constant volume, vol 12
     sta APU_NOISE_CTRL
-    lda #$06                ; Higher noise pitch
-    ora #$80                ; Metallic mode for snare
+    lda #$05                ; Medium-high noise pitch (no bit 7!)
     sta APU_NOISE_FREQ
-    lda #%00111000
+    lda #%00011000          ; Shorter length
     sta APU_NOISE_LEN
     
-    lda #$08
+    lda #$06                ; Shorter decay
     sta snare_decay
     
 @no_snare:

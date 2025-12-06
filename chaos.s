@@ -268,6 +268,7 @@ NMI:
     jsr update_kick_only
     jsr update_bass_only
     jsr update_synth_stab
+    jsr update_arpeggio_simple
 
     pla
     tay
@@ -346,7 +347,7 @@ update_kick_only:
     rts
 
 @check_hihat:
-    ; Frame 8: Hi-hat
+    ; Frame 8: Hi-hat (simple, like before)
     cmp #$08
     bne @silence
     lda #%00111000          ; Vol 8
@@ -364,7 +365,7 @@ update_kick_only:
     rts
 
 ;------------------------------------------------------------------------------
-; Simple Bass - Triangle channel, changes note every 32 frames
+; Bass - Triangle channel, 8-note pattern (original working version)
 ;------------------------------------------------------------------------------
 update_bass_only:
     ; Play bass note - change every 32 frames
@@ -372,7 +373,7 @@ update_bass_only:
     and #$1F                ; Every 32 frames = new note
     bne @sustain
     
-    ; New bass note! Get note from pattern
+    ; New bass note! Get note from 8-note pattern
     lda frame_count
     lsr a
     lsr a
@@ -388,13 +389,14 @@ update_bass_only:
     lda bass_notes_hi, x
     sta APU_TRI_HI
     
-    ; Enable triangle with short linear counter
-    lda #%11000000          ; Linear counter = 0, but halt flag set
+    ; Enable triangle
+    lda #%11111111          
     sta APU_TRI_CTRL
+    rts
     
 @sustain:
     ; Keep triangle playing
-    lda #%11111111          ; Max linear counter
+    lda #%11111111          
     sta APU_TRI_CTRL
     rts
 
@@ -447,6 +449,42 @@ update_synth_stab:
 @stab_silent:
     lda #%10110000          ; Vol 0
     sta APU_PULSE1_CTRL
+    rts
+
+;------------------------------------------------------------------------------
+; Fast Arpeggio - Pulse 2, runs constantly
+;------------------------------------------------------------------------------
+update_arpeggio_simple:
+    ; Arpeggio every 4 frames for fast trance feel
+    lda frame_count
+    and #$03
+    bne @arp_decay
+    
+    ; New arp note!
+    lda frame_count
+    lsr a
+    lsr a                   ; Divide by 4
+    and #$07                ; 8 notes in arp pattern
+    tax
+    
+    ; Set note
+    lda arp_notes_lo, x
+    sta APU_PULSE2_LO
+    lda arp_notes_hi, x
+    sta APU_PULSE2_HI
+    
+    ; 25% duty for sharp arp sound
+    lda #%01111001          ; 25% duty, vol 9
+    sta APU_PULSE2_CTRL
+    rts
+
+@arp_decay:
+    ; Quick decay between notes
+    lda frame_count
+    and #$03
+    tax
+    lda arp_vol_table, x
+    sta APU_PULSE2_CTRL
     rts
 
 ;------------------------------------------------------------------------------
@@ -1905,7 +1943,7 @@ kick_decay_table:
     .byte %00110111          ; Frame 2: vol 7
     .byte %00110011          ; Frame 3: vol 3 (then silent)
 
-; Bass note frequencies (triangle channel timer values) - E minor scale
+; Bass note frequencies - 8 note pattern (original)
 bass_notes_lo:
     .byte $9D               ; E2 (low E)
     .byte $9D               ; E2
@@ -1936,6 +1974,33 @@ stab_notes_hi:
     .byte $01               ; G4
     .byte $00               ; B3
     .byte $00               ; E4
+
+; Arpeggio notes - fast E minor arp (higher octave for sparkle)
+arp_notes_lo:
+    .byte $54               ; E5
+    .byte $A9               ; G5  
+    .byte $17               ; B5
+    .byte $A9               ; G5
+    .byte $54               ; E5
+    .byte $17               ; B5
+    .byte $54               ; E5
+    .byte $FC               ; D5
+arp_notes_hi:
+    .byte $00               ; E5
+    .byte $00               ; G5
+    .byte $00               ; B5
+    .byte $00               ; G5
+    .byte $00               ; E5
+    .byte $00               ; B5
+    .byte $00               ; E5
+    .byte $00               ; D5
+
+; Arp volume decay (frames 0-3)
+arp_vol_table:
+    .byte %01111001          ; Frame 0: vol 9 (hit)
+    .byte %01110110          ; Frame 1: vol 6
+    .byte %01110011          ; Frame 2: vol 3
+    .byte %01110001          ; Frame 3: vol 1
 
 ;------------------------------------------------------------------------------
 ; Vectors
@@ -2069,3 +2134,4 @@ stab_notes_hi:
     .byte ((i * 79 + 151) ^ (i >> 3)) & $FF
     .byte ((i * 83 + 157) ^ (i >> 3)) & $FF
 .endrepeat
+

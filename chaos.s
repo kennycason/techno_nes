@@ -171,10 +171,9 @@ RESET:
     lda #$02
     sta intensity
 
-    ; Initialize APU - DISABLED FOR TESTING
-    ; jsr init_audio
-    lda #$00
-    sta APU_STATUS          ; Silence everything
+    ; Initialize APU - minimal
+    lda #%00001100          ; Enable triangle and noise only
+    sta APU_STATUS
     
     ; Load initial palette
     jsr load_palette
@@ -247,10 +246,7 @@ NMI:
     sta current_mode
     
 @same_mode:
-    ; ALL AUDIO DISABLED FOR TESTING
-    ; jsr update_music
-
-    ; Update palette
+    ; Update palette FIRST (during vblank)
     jsr update_palette
     
     ; Update pattern
@@ -263,6 +259,9 @@ NMI:
     lda #$00
     sta PPU_SCROLL
     sta PPU_SCROLL
+    
+    ; Audio update LAST (after PPU work is done)
+    jsr update_kick_only
 
     pla
     tay
@@ -305,6 +304,22 @@ init_audio:
     lda #%00111111          ; No envelope, vol 15
     sta APU_NOISE_CTRL
     
+    rts
+
+;------------------------------------------------------------------------------
+; ULTRA SIMPLE - Kick using frame_count, minimal APU writes
+;------------------------------------------------------------------------------
+update_kick_only:
+    ; Set noise frequency once (don't keep changing it)
+    lda #$02
+    sta APU_NOISE_FREQ
+    
+    ; Volume based on frame position
+    lda frame_count
+    and #$0F                ; Every 16 frames
+    tax
+    lda kick_vol_table, x
+    sta APU_NOISE_CTRL
     rts
 
 ;------------------------------------------------------------------------------
@@ -1755,6 +1770,25 @@ arp_fade_vol:
     .byte %01110111          ; Frame 1: vol 7
     .byte %01110100          ; Frame 2: vol 4
     .byte %01110010          ; Frame 3: vol 2
+
+; Kick volume table - 16 frames per cycle
+kick_vol_table:
+    .byte %00111111          ; Frame 0: vol 15 (hit!)
+    .byte %00111100          ; Frame 1: vol 12
+    .byte %00111001          ; Frame 2: vol 9
+    .byte %00110110          ; Frame 3: vol 6
+    .byte %00110011          ; Frame 4: vol 3
+    .byte %00110001          ; Frame 5: vol 1
+    .byte %00110000          ; Frame 6: vol 0
+    .byte %00110000          ; Frame 7: vol 0
+    .byte %00110000          ; Frame 8: vol 0
+    .byte %00110000          ; Frame 9: vol 0
+    .byte %00110000          ; Frame 10: vol 0
+    .byte %00110000          ; Frame 11: vol 0
+    .byte %00110000          ; Frame 12: vol 0
+    .byte %00110000          ; Frame 13: vol 0
+    .byte %00110000          ; Frame 14: vol 0
+    .byte %00110000          ; Frame 15: vol 0
 
 ;------------------------------------------------------------------------------
 ; Vectors

@@ -171,9 +171,13 @@ RESET:
     lda #$02
     sta intensity
 
-    ; Initialize APU - minimal
-    lda #%00001100          ; Enable triangle and noise only
+    ; Initialize APU - enable all channels
+    lda #%00001111          ; Enable pulse1, pulse2, triangle, noise
     sta APU_STATUS
+    ; Disable pulse sweep units
+    lda #$08
+    sta APU_PULSE1_SWEEP
+    sta APU_PULSE2_SWEEP
     
     ; Load initial palette
     jsr load_palette
@@ -263,6 +267,7 @@ NMI:
     ; Audio update LAST (after PPU work is done)
     jsr update_kick_only
     jsr update_bass_only
+    jsr update_synth_stab
 
     pla
     tay
@@ -308,33 +313,52 @@ init_audio:
     rts
 
 ;------------------------------------------------------------------------------
-; Simple EDM Kick - triggers properly
+; EDM Kick + Hi-hat - clean, no static
 ;------------------------------------------------------------------------------
 update_kick_only:
     lda frame_count
-    and #$0F                ; Every 16 frames (~4 kicks/sec)
-    bne @decay
+    and #$0F                ; Every 16 frames
     
-    ; KICK HIT! Trigger the sound
-    lda #%00111111          ; Vol 15, constant volume
+    ; Frame 0: KICK
+    bne @not_kick
+    lda #%00111111          ; Vol 15
     sta APU_NOISE_CTRL
-    lda #$02                ; Low pitch = punchy
+    lda #$01                ; Very low pitch = deep kick
     sta APU_NOISE_FREQ
-    lda #$08                ; Trigger sound (length doesn't matter with constant vol)
+    lda #$18
     sta APU_NOISE_LEN
     rts
     
-@decay:
-    ; Decay based on frame position
-    cmp #$06
-    bcs @silent             ; Frames 6-15: silent
-    ; Frames 1-5: decay
-    tax
-    lda kick_decay_table, x
+@not_kick:
+    ; Frame 1: Kick decay
+    cmp #$01
+    bne @not_decay1
+    lda #%00111010          ; Vol 10
     sta APU_NOISE_CTRL
     rts
     
-@silent:
+@not_decay1:
+    ; Frame 2: Last decay then OFF
+    cmp #$02
+    bne @check_hihat
+    lda #%00110101          ; Vol 5
+    sta APU_NOISE_CTRL
+    rts
+
+@check_hihat:
+    ; Frame 8: Hi-hat
+    cmp #$08
+    bne @silence
+    lda #%00111000          ; Vol 8
+    sta APU_NOISE_CTRL
+    lda #$0F                ; Highest pitch = crisp hi-hat
+    sta APU_NOISE_FREQ
+    lda #$08
+    sta APU_NOISE_LEN
+    rts
+    
+@silence:
+    ; All other frames: SILENCE
     lda #%00110000          ; Vol 0
     sta APU_NOISE_CTRL
     rts
@@ -372,6 +396,57 @@ update_bass_only:
     ; Keep triangle playing
     lda #%11111111          ; Max linear counter
     sta APU_TRI_CTRL
+    rts
+
+;------------------------------------------------------------------------------
+; Synth Stab - Pulse channel, plays chord stabs
+;------------------------------------------------------------------------------
+update_synth_stab:
+    ; Stab every 32 frames, offset from kick
+    lda frame_count
+    and #$1F
+    cmp #$04                ; Stab on frame 4 of each 32-frame cycle
+    bne @stab_decay
+    
+    ; STAB! Play a note
+    lda #%10111111          ; 50% duty, vol 15
+    sta APU_PULSE1_CTRL
+    
+    ; Pick note based on which 32-frame cycle we're in
+    lda frame_count
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    lsr a                   ; Divide by 32
+    and #$03                ; 4 different notes
+    tax
+    lda stab_notes_lo, x
+    sta APU_PULSE1_LO
+    lda stab_notes_hi, x
+    sta APU_PULSE1_HI
+    rts
+
+@stab_decay:
+    ; Decay the stab
+    lda frame_count
+    and #$1F
+    cmp #$04
+    bcc @stab_silent        ; Before stab: silent
+    cmp #$0C
+    bcs @stab_silent        ; After frame 12: silent
+    ; Frames 5-11: decay
+    sec
+    sbc #$04                ; 1-7
+    eor #$07                ; Invert: 7-1
+    asl a                   ; *2 for volume
+    ora #%10110000          ; 50% duty + constant vol
+    sta APU_PULSE1_CTRL
+    rts
+
+@stab_silent:
+    lda #%10110000          ; Vol 0
+    sta APU_PULSE1_CTRL
     rts
 
 ;------------------------------------------------------------------------------
@@ -1823,14 +1898,12 @@ arp_fade_vol:
     .byte %01110100          ; Frame 2: vol 4
     .byte %01110010          ; Frame 3: vol 2
 
-; Kick decay table - frames 1-5 (index 0 unused)
+; Kick decay table - frames 1-3 (fast decay, no static)
 kick_decay_table:
-    .byte %00111111          ; (unused - frame 0 handled separately)
-    .byte %00111100          ; Frame 1: vol 12
-    .byte %00111001          ; Frame 2: vol 9
-    .byte %00110110          ; Frame 3: vol 6
-    .byte %00110011          ; Frame 4: vol 3
-    .byte %00110001          ; Frame 5: vol 1
+    .byte %00111111          ; (unused - frame 0 handled separately)  
+    .byte %00111011          ; Frame 1: vol 11
+    .byte %00110111          ; Frame 2: vol 7
+    .byte %00110011          ; Frame 3: vol 3 (then silent)
 
 ; Bass note frequencies (triangle channel timer values) - E minor scale
 bass_notes_lo:
@@ -1851,6 +1924,18 @@ bass_notes_hi:
     .byte $05               ; A2
     .byte $05               ; G2
     .byte $05               ; E2
+
+; Synth stab notes (higher octave) - E minor chord tones
+stab_notes_lo:
+    .byte $A9               ; E4
+    .byte $52               ; G4
+    .byte $FD               ; B3
+    .byte $A9               ; E4
+stab_notes_hi:
+    .byte $00               ; E4
+    .byte $01               ; G4
+    .byte $00               ; B3
+    .byte $00               ; E4
 
 ;------------------------------------------------------------------------------
 ; Vectors

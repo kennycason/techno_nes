@@ -75,7 +75,7 @@ lead_decay:     .res 1      ; lead decay
 intensity:      .res 1      ; current music intensity level
 
 ; Mode constants
-NUM_MODES       = 16        ; number of visual modes
+NUM_MODES       = 17        ; number of visual modes
 MODE_DURATION   = 120       ; frames per mode (~2 seconds at 60fps)
 
 ; Music constants  
@@ -1737,6 +1737,63 @@ mode_vortex:
     rts
 
 ;------------------------------------------------------------------------------
+; Mode 16: Pulse - Concentric rings radiating from center
+;------------------------------------------------------------------------------
+mode_pulse:
+    ldx #$30
+@loop:
+    bit PPU_STATUS
+    lda #$20
+    sta PPU_ADDR
+    jsr random
+    sta PPU_ADDR
+    sta temp
+    
+    ; Get x,y from address
+    and #$1F                ; x = 0-31
+    sec
+    sbc #$10                ; x offset from center (-16 to 15)
+    bpl @px_pos
+    eor #$FF
+    adc #$01
+@px_pos:
+    sta temp+1              ; |x|
+    
+    lda temp
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    lsr a                   ; y = 0-7
+    asl a
+    asl a                   ; scale up
+    sec
+    sbc #$0F                ; y offset from center
+    bpl @py_pos
+    eor #$FF
+    adc #$01
+@py_pos:
+    ; temp+1 = |x|, A = |y|
+    ; Manhattan distance = |x| + |y|
+    clc
+    adc temp+1
+    
+    ; Add phase for pulsing animation
+    clc
+    adc phase
+    adc phase
+    adc phase               ; Triple phase = fast pulse
+    
+    ; Create ring pattern
+    and #$0F                ; 16 levels
+    ora #$01                ; Avoid tile 0
+    sta PPU_DATA
+    
+    dex
+    bne @loop
+    rts
+
+;------------------------------------------------------------------------------
 ; Update Attributes
 ;------------------------------------------------------------------------------
 update_attributes:
@@ -1783,10 +1840,12 @@ mode_table:
     .word mode_cellular         ; 13
     .word mode_lissajous        ; 14
     .word mode_vortex           ; 15
+    .word mode_pulse            ; 16 - NEW!
 
 ; Mode hue offsets
 mode_hue_offsets:
     .byte $00, $02, $04, $06, $08, $0A, $0C, $0E
+    .byte $01                   ; mode 16
     .byte $01, $03, $05, $07, $09, $0B, $0D, $0F
 
 ; Palette offsets

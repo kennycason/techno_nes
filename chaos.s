@@ -262,6 +262,7 @@ NMI:
     
     ; Audio update LAST (after PPU work is done)
     jsr update_kick_only
+    jsr update_bass_only
 
     pla
     tay
@@ -336,6 +337,41 @@ update_kick_only:
 @silent:
     lda #%00110000          ; Vol 0
     sta APU_NOISE_CTRL
+    rts
+
+;------------------------------------------------------------------------------
+; Simple Bass - Triangle channel, changes note every 32 frames
+;------------------------------------------------------------------------------
+update_bass_only:
+    ; Play bass note - change every 32 frames
+    lda frame_count
+    and #$1F                ; Every 32 frames = new note
+    bne @sustain
+    
+    ; New bass note! Get note from pattern
+    lda frame_count
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    lsr a                   ; Divide by 32
+    and #$07                ; 8 notes in pattern
+    tax
+    
+    ; Set triangle frequency
+    lda bass_notes_lo, x
+    sta APU_TRI_LO
+    lda bass_notes_hi, x
+    sta APU_TRI_HI
+    
+    ; Enable triangle with short linear counter
+    lda #%11000000          ; Linear counter = 0, but halt flag set
+    sta APU_TRI_CTRL
+    
+@sustain:
+    ; Keep triangle playing
+    lda #%11111111          ; Max linear counter
+    sta APU_TRI_CTRL
     rts
 
 ;------------------------------------------------------------------------------
@@ -1795,6 +1831,26 @@ kick_decay_table:
     .byte %00110110          ; Frame 3: vol 6
     .byte %00110011          ; Frame 4: vol 3
     .byte %00110001          ; Frame 5: vol 1
+
+; Bass note frequencies (triangle channel timer values) - E minor scale
+bass_notes_lo:
+    .byte $9D               ; E2 (low E)
+    .byte $9D               ; E2
+    .byte $4C               ; G2
+    .byte $9D               ; E2
+    .byte $9D               ; E2
+    .byte $00               ; A2
+    .byte $4C               ; G2
+    .byte $9D               ; E2
+bass_notes_hi:
+    .byte $05               ; E2
+    .byte $05               ; E2
+    .byte $05               ; G2
+    .byte $05               ; E2
+    .byte $05               ; E2
+    .byte $05               ; A2
+    .byte $05               ; G2
+    .byte $05               ; E2
 
 ;------------------------------------------------------------------------------
 ; Vectors

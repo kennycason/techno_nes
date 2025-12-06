@@ -202,13 +202,26 @@ RESET:
 ; Main Loop - Simple
 ;------------------------------------------------------------------------------
 main_loop:
-    ; Update coefficients slowly
-    inc coeff_a
+    ; Update coefficients at different rates for variety
+    inc coeff_a             ; Every frame (fast)
+    
     lda coeff_a
     and #$03
     bne @skip_b
-    inc coeff_b
+    inc coeff_b             ; Every 4 frames
 @skip_b:
+
+    lda coeff_a
+    and #$07
+    bne @skip_c
+    inc coeff_c             ; Every 8 frames (simpler: just inc)
+@skip_c:
+
+    lda coeff_a
+    and #$1F
+    bne @skip_d
+    inc coeff_d             ; Every 32 frames (slower, safer)
+@skip_d:
     
     ; Wait for NMI (simple)
     lda frame_count
@@ -1135,6 +1148,8 @@ mode_plasma:
     and #$1F
     clc
     adc phase
+    adc coeff_c             ; Adds variation
+    and #$3F                ; CLAMP to 0-63 for sine table safety
     jsr get_sine
     sta temp
     
@@ -1147,6 +1162,8 @@ mode_plasma:
     clc
     adc phase
     adc coeff_b
+    adc coeff_d             ; More variation
+    and #$3F                ; CLAMP to 0-63 for sine table safety
     jsr get_sine
     clc
     adc temp
@@ -1299,6 +1316,8 @@ mode_ripple:
     adc phase
     adc phase
     adc coeff_a
+    clc
+    adc coeff_d             ; Changed from eor to adc (safer)
     and #$1F
     ora #$01
     sta PPU_DATA
@@ -1411,6 +1430,7 @@ mode_spiral:
     clc
     adc phase
     adc phase
+    adc coeff_c             ; NEW: spiral morphs over time
     and #$1F
     ora #$01
     sta PPU_DATA

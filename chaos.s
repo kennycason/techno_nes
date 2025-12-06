@@ -307,18 +307,34 @@ init_audio:
     rts
 
 ;------------------------------------------------------------------------------
-; ULTRA SIMPLE - Kick using frame_count, minimal APU writes
+; Simple EDM Kick - triggers properly
 ;------------------------------------------------------------------------------
 update_kick_only:
-    ; Set noise frequency once (don't keep changing it)
-    lda #$02
-    sta APU_NOISE_FREQ
-    
-    ; Volume based on frame position
     lda frame_count
-    and #$0F                ; Every 16 frames
+    and #$0F                ; Every 16 frames (~4 kicks/sec)
+    bne @decay
+    
+    ; KICK HIT! Trigger the sound
+    lda #%00111111          ; Vol 15, constant volume
+    sta APU_NOISE_CTRL
+    lda #$02                ; Low pitch = punchy
+    sta APU_NOISE_FREQ
+    lda #$08                ; Trigger sound (length doesn't matter with constant vol)
+    sta APU_NOISE_LEN
+    rts
+    
+@decay:
+    ; Decay based on frame position
+    cmp #$06
+    bcs @silent             ; Frames 6-15: silent
+    ; Frames 1-5: decay
     tax
-    lda kick_vol_table, x
+    lda kick_decay_table, x
+    sta APU_NOISE_CTRL
+    rts
+    
+@silent:
+    lda #%00110000          ; Vol 0
     sta APU_NOISE_CTRL
     rts
 
@@ -1771,24 +1787,14 @@ arp_fade_vol:
     .byte %01110100          ; Frame 2: vol 4
     .byte %01110010          ; Frame 3: vol 2
 
-; Kick volume table - 16 frames per cycle
-kick_vol_table:
-    .byte %00111111          ; Frame 0: vol 15 (hit!)
+; Kick decay table - frames 1-5 (index 0 unused)
+kick_decay_table:
+    .byte %00111111          ; (unused - frame 0 handled separately)
     .byte %00111100          ; Frame 1: vol 12
     .byte %00111001          ; Frame 2: vol 9
     .byte %00110110          ; Frame 3: vol 6
     .byte %00110011          ; Frame 4: vol 3
     .byte %00110001          ; Frame 5: vol 1
-    .byte %00110000          ; Frame 6: vol 0
-    .byte %00110000          ; Frame 7: vol 0
-    .byte %00110000          ; Frame 8: vol 0
-    .byte %00110000          ; Frame 9: vol 0
-    .byte %00110000          ; Frame 10: vol 0
-    .byte %00110000          ; Frame 11: vol 0
-    .byte %00110000          ; Frame 12: vol 0
-    .byte %00110000          ; Frame 13: vol 0
-    .byte %00110000          ; Frame 14: vol 0
-    .byte %00110000          ; Frame 15: vol 0
 
 ;------------------------------------------------------------------------------
 ; Vectors

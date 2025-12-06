@@ -347,12 +347,12 @@ update_kick_only:
     rts
 
 @check_hihat:
-    ; Frame 8: Hi-hat (simple, like before)
+    ; Frame 8: Hi-hat only (simple, stable)
     cmp #$08
     bne @silence
     lda #%00111000          ; Vol 8
     sta APU_NOISE_CTRL
-    lda #$0F                ; Highest pitch = crisp hi-hat
+    lda #$0F                ; High pitch
     sta APU_NOISE_FREQ
     lda #$08
     sta APU_NOISE_LEN
@@ -2002,25 +2002,25 @@ kick_decay_table:
     .byte %00110111          ; Frame 2: vol 7
     .byte %00110011          ; Frame 3: vol 3 (then silent)
 
-; Bass note frequencies - 8 note pattern (original)
+; Bass note frequencies - 8 note pattern (more melodic!)
 bass_notes_lo:
-    .byte $9D               ; E2 (low E)
-    .byte $9D               ; E2
-    .byte $4C               ; G2
-    .byte $9D               ; E2
-    .byte $9D               ; E2
-    .byte $00               ; A2
-    .byte $4C               ; G2
-    .byte $9D               ; E2
+    .byte $9D               ; E2 - root
+    .byte $4C               ; G2 - minor 3rd
+    .byte $9D               ; E2 - root
+    .byte $00               ; A2 - 4th
+    .byte $9D               ; E2 - root
+    .byte $F8               ; B2 - 5th
+    .byte $4C               ; G2 - minor 3rd
+    .byte $00               ; A2 - 4th
 bass_notes_hi:
     .byte $05               ; E2
-    .byte $05               ; E2
     .byte $05               ; G2
-    .byte $05               ; E2
     .byte $05               ; E2
     .byte $05               ; A2
-    .byte $05               ; G2
     .byte $05               ; E2
+    .byte $04               ; B2
+    .byte $05               ; G2
+    .byte $05               ; A2
 
 ; Synth stab notes (higher octave) - E minor chord tones
 stab_notes_lo:

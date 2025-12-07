@@ -39,6 +39,20 @@ APU_DMC_LOAD     = $4011
 APU_STATUS       = $4015
 APU_FRAME        = $4017
 
+; Controller
+JOY1             = $4016
+JOY2             = $4017
+
+; Button masks
+BTN_RIGHT        = %00000001
+BTN_LEFT         = %00000010
+BTN_DOWN         = %00000100
+BTN_UP           = %00001000
+BTN_START        = %00010000
+BTN_SELECT       = %00100000
+BTN_B            = %01000000
+BTN_A            = %10000000
+
 DMC_FREQ    = $4010
 
 ;------------------------------------------------------------------------------
@@ -54,6 +68,8 @@ coeff_a:        .res 1      ; morphing coefficient A
 coeff_b:        .res 1      ; morphing coefficient B  
 coeff_c:        .res 1      ; morphing coefficient C
 coeff_d:        .res 1      ; morphing coefficient D
+buttons:        .res 1      ; current button state
+buttons_prev:   .res 1      ; previous button state (for edge detection)
 row:            .res 1      ; current row being drawn
 col:            .res 1      ; current column
 tile_val:       .res 1      ; computed tile value
@@ -75,7 +91,7 @@ lead_decay:     .res 1      ; lead decay
 intensity:      .res 1      ; current music intensity level
 
 ; Mode constants
-NUM_MODES       = 18        ; number of visual modes
+NUM_MODES       = 16        ; number of visual modes (stable set)
 MODE_DURATION   = 120       ; frames per mode (~2 seconds at 60fps)
 
 ; Music constants  
@@ -202,26 +218,57 @@ RESET:
 ; Main Loop - Simple
 ;------------------------------------------------------------------------------
 main_loop:
-    ; Update coefficients at different rates for variety
-    inc coeff_a             ; Every frame (fast)
+    ; Read controller
+    jsr read_controller
+    
+    ; Check for RIGHT press (new press only)
+    lda buttons
+    and #BTN_RIGHT
+    beq @no_right
+    lda buttons_prev
+    and #BTN_RIGHT
+    bne @no_right           ; Already held, skip
+    ; RIGHT pressed - next mode
+    inc current_mode
+    lda current_mode
+    cmp #NUM_MODES
+    bcc @mode_ok
+    lda #$00
+    sta current_mode
+@mode_ok:
+    jmp @done_input
+    
+@no_right:
+    ; Check for LEFT press
+    lda buttons
+    and #BTN_LEFT
+    beq @no_left
+    lda buttons_prev
+    and #BTN_LEFT
+    bne @no_left
+    ; LEFT pressed - previous mode
+    lda current_mode
+    beq @wrap_mode
+    dec current_mode
+    jmp @done_input
+@wrap_mode:
+    lda #NUM_MODES-1
+    sta current_mode
+    
+@no_left:
+@done_input:
+    ; Save button state for next frame
+    lda buttons
+    sta buttons_prev
+    
+    ; Update coefficients (simple version)
+    inc coeff_a             ; Every frame
     
     lda coeff_a
     and #$03
     bne @skip_b
     inc coeff_b             ; Every 4 frames
 @skip_b:
-
-    lda coeff_a
-    and #$07
-    bne @skip_c
-    inc coeff_c             ; Every 8 frames (simpler: just inc)
-@skip_c:
-
-    lda coeff_a
-    and #$1F
-    bne @skip_d
-    inc coeff_d             ; Every 32 frames (slower, safer)
-@skip_d:
     
     ; Wait for NMI (simple)
     lda frame_count
@@ -250,17 +297,8 @@ NMI:
     ; Increment phase for animations
     inc phase
     
-    ; Mode timer - simple countdown
-    dec mode_timer
-    bne @same_mode
-    
-    ; Switch mode
-    lda #MODE_DURATION
-    sta mode_timer
-    inc current_mode
-    lda current_mode
-    and #$0F
-    sta current_mode
+    ; Mode timer disabled - using manual D-pad control
+    ; (Mode switching now happens in main_loop via controller)
     
 @same_mode:
     ; Update palette FIRST (during vblank)
@@ -894,6 +932,28 @@ update_arpeggio:
     rts
 
 ;------------------------------------------------------------------------------
+; Read Controller 1
+;------------------------------------------------------------------------------
+read_controller:
+    ; Strobe controller
+    lda #$01
+    sta JOY1
+    lda #$00
+    sta JOY1
+    
+    ; Read 8 buttons into buttons variable
+    ldx #$08
+    lda #$00
+    sta buttons
+@read_loop:
+    lda JOY1
+    lsr a                   ; Bit 0 -> carry
+    rol buttons             ; Carry -> buttons
+    dex
+    bne @read_loop
+    rts
+
+;------------------------------------------------------------------------------
 ; Random Number Generator - with safety check
 ;------------------------------------------------------------------------------
 random:
@@ -927,9 +987,13 @@ random:
 ; Sine Table Lookup
 ;------------------------------------------------------------------------------
 get_sine:
+    ; Save X (used as loop counter in callers)
+    stx temp+7              ; Use last temp slot
     and #$1F
     tax
     lda sine_table, x
+    ; Restore X
+    ldx temp+7
     rts
 
 ;------------------------------------------------------------------------------
@@ -1148,8 +1212,6 @@ mode_plasma:
     and #$1F
     clc
     adc phase
-    adc coeff_c             ; Adds variation
-    and #$3F                ; CLAMP to 0-63 for sine table safety
     jsr get_sine
     sta temp
     
@@ -1162,8 +1224,6 @@ mode_plasma:
     clc
     adc phase
     adc coeff_b
-    adc coeff_d             ; More variation
-    and #$3F                ; CLAMP to 0-63 for sine table safety
     jsr get_sine
     clc
     adc temp
@@ -1316,8 +1376,6 @@ mode_ripple:
     adc phase
     adc phase
     adc coeff_a
-    clc
-    adc coeff_d             ; Changed from eor to adc (safer)
     and #$1F
     ora #$01
     sta PPU_DATA
@@ -1430,7 +1488,6 @@ mode_spiral:
     clc
     adc phase
     adc phase
-    adc coeff_c             ; NEW: spiral morphs over time
     and #$1F
     ora #$01
     sta PPU_DATA
@@ -1864,6 +1921,118 @@ mode_diamond:
     rts
 
 ;------------------------------------------------------------------------------
+; Mode 18: Rings - Expanding circles from a bouncing center
+;------------------------------------------------------------------------------
+mode_rings:
+    ldx #$30
+@loop:
+    bit PPU_STATUS
+    lda #$20
+    sta PPU_ADDR
+    jsr random
+    sta PPU_ADDR
+    sta temp
+    
+    ; Get x coordinate (0-31)
+    and #$1F
+    sta temp+1
+    
+    ; Get y coordinate (0-29, scaled)
+    lda temp
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    lsr a                   ; 0-7
+    asl a
+    asl a                   ; 0-28
+    sta temp+2
+    
+    ; Calculate bouncing center X (using sine of phase)
+    lda phase
+    and #$1F
+    tax
+    lda sine_table, x       ; 0-31
+    lsr a                   ; 0-15
+    clc
+    adc #$08                ; 8-23 (centered on screen)
+    sta temp+3              ; center_x
+    
+    ; Calculate bouncing center Y (using sine of phase + offset)
+    lda phase
+    clc
+    adc #$08                ; Offset so X and Y are out of phase
+    and #$1F
+    tax
+    lda sine_table, x
+    lsr a
+    lsr a                   ; 0-7
+    clc
+    adc #$08                ; 8-15 (centered vertically)
+    sta temp+4              ; center_y
+    
+    ; Distance from center: |x - cx| + |y - cy| (Manhattan)
+    lda temp+1              ; x
+    sec
+    sbc temp+3              ; x - center_x
+    bpl @rx_pos
+    eor #$FF
+    adc #$01
+@rx_pos:
+    sta temp+5              ; |x - cx|
+    
+    lda temp+2              ; y
+    sec
+    sbc temp+4              ; y - center_y
+    bpl @ry_pos
+    eor #$FF
+    adc #$01
+@ry_pos:
+    clc
+    adc temp+5              ; |x - cx| + |y - cy| = distance
+    
+    ; Subtract phase to make rings expand outward
+    sec
+    sbc phase
+    sbc phase               ; Double speed expansion
+    
+    ; Create ring pattern
+    and #$0F                ; 16 ring levels
+    ora #$01                ; Avoid tile 0
+    sta PPU_DATA
+    
+    dex
+    bne @loop
+    rts
+
+;------------------------------------------------------------------------------
+; DEBUG: Show current mode number in top-left (tiles 0-1)
+;------------------------------------------------------------------------------
+debug_show_mode:
+    bit PPU_STATUS
+    ; Write to top-left corner ($2000)
+    lda #$20
+    sta PPU_ADDR
+    lda #$00
+    sta PPU_ADDR
+    
+    ; Write mode number as tile (add $10 to make it visible)
+    lda current_mode
+    clc
+    adc #$10                ; Offset so 0 isn't transparent
+    sta PPU_DATA
+    
+    ; Also write mode_timer in next position for debugging
+    lda mode_timer
+    lsr a
+    lsr a
+    lsr a                   ; Divide by 8 for smaller range
+    clc
+    adc #$10
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
 ; Update Attributes
 ;------------------------------------------------------------------------------
 update_attributes:
@@ -1911,7 +2080,8 @@ mode_table:
     .word mode_lissajous        ; 14
     .word mode_vortex           ; 15
     .word mode_pulse            ; 16
-    .word mode_diamond          ; 17 - NEW!
+    .word mode_diamond          ; 17
+    .word mode_rings            ; 18 - NEW! Bouncing expanding rings
 
 ; Mode hue offsets
 mode_hue_offsets:

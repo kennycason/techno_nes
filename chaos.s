@@ -75,7 +75,7 @@ lead_decay:     .res 1      ; lead decay
 intensity:      .res 1      ; current music intensity level
 
 ; Mode constants
-NUM_MODES       = 17        ; number of visual modes
+NUM_MODES       = 18        ; number of visual modes
 MODE_DURATION   = 120       ; frames per mode (~2 seconds at 60fps)
 
 ; Music constants  
@@ -1814,6 +1814,56 @@ mode_pulse:
     rts
 
 ;------------------------------------------------------------------------------
+; Mode 17: Diamond Wave - Diagonal stripes that create diamond patterns
+;------------------------------------------------------------------------------
+mode_diamond:
+    ldx #$30
+@loop:
+    bit PPU_STATUS
+    lda #$20
+    sta PPU_ADDR
+    jsr random
+    sta PPU_ADDR
+    sta temp
+    
+    ; Get x and y components
+    and #$1F                ; x = 0-31
+    sta temp+1
+    
+    lda temp
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    lsr a                   ; y = 0-7
+    asl a
+    asl a                   ; Scale up y
+    sta temp+2
+    
+    ; Diamond pattern: (x + y) XOR (x - y)
+    lda temp+1
+    clc
+    adc temp+2              ; x + y
+    clc
+    adc phase               ; Animate
+    sta temp+3
+    
+    lda temp+1
+    sec
+    sbc temp+2              ; x - y (may go negative, that's ok)
+    clc  
+    adc coeff_b             ; Add variation
+    eor temp+3              ; XOR creates diamond interference
+    
+    and #$1F                ; Clamp to valid tiles
+    ora #$01                ; Avoid tile 0
+    sta PPU_DATA
+    
+    dex
+    bne @loop
+    rts
+
+;------------------------------------------------------------------------------
 ; Update Attributes
 ;------------------------------------------------------------------------------
 update_attributes:
@@ -1860,7 +1910,8 @@ mode_table:
     .word mode_cellular         ; 13
     .word mode_lissajous        ; 14
     .word mode_vortex           ; 15
-    .word mode_pulse            ; 16 - NEW!
+    .word mode_pulse            ; 16
+    .word mode_diamond          ; 17 - NEW!
 
 ; Mode hue offsets
 mode_hue_offsets:

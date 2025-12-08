@@ -42,6 +42,10 @@ arp_pattern:    .res 1      ; Which arp pattern
 intensity:      .res 1      ; Builds up over time
 hat_pattern:    .res 1      ; Hi-hat pattern variation
 lead_duty:      .res 1      ; Lead duty cycle for filter sweep
+acid_note:      .res 1      ; Current acid bass note
+acid_slide:     .res 1      ; Slide target
+drop_timer:     .res 1      ; For drop impact effect
+groove_var:     .res 1      ; Groove variation
 
 ;------------------------------------------------------------------------------
 ; iNES Header
@@ -178,24 +182,30 @@ update_music:
 @not_bar:
 @not_beat:
 
-    ; Check if we're in breakdown
+    ; Check song section for different modes
     lda song_section
+    cmp #$01                ; Section 1 = acid mode
+    beq @acid_mode
     cmp #$02                ; Section 2 = breakdown
     beq @breakdown_mode
-    cmp #$04                ; Section 4 = buildup/riser
+    cmp #$03                ; Section 3 = DROP!
+    beq @drop_mode
+    cmp #$05                ; Section 5 = buildup/riser
     beq @buildup_mode
+    cmp #$06                ; Section 6 = minimal
+    beq @minimal_mode
     
-    ; Normal mode - all elements
-    ; Check for fill beat (last beat of every 4 bars)
+    ; Normal mode (sections 0, 4) - all elements
+    ; Check for fill beat
     lda bar_count
     and #$03
     cmp #$03
     bne @normal_kick
     lda beat_count
     and #$0F
-    cmp #$0E                ; Beats 14-15 = fill
+    cmp #$0E
     bcc @normal_kick
-    jsr update_stutter      ; Stutter fill!
+    jsr update_stutter
     jmp @after_kick
 @normal_kick:
     jsr update_kick
@@ -205,47 +215,88 @@ update_music:
     jsr update_lead
     jsr update_arp
     rts
+
+@acid_mode:
+    ; Acid techno - 303-style bass!
+    jsr update_kick
+    jsr update_hihat
+    jsr update_acid         ; Acid bass line!
+    jsr update_arp
+    rts
     
 @breakdown_mode:
-    ; Breakdown - just bass and minimal hats
+    ; Breakdown - atmospheric
     jsr update_bass
+    jsr update_pad
     jsr update_hihat
-    jsr update_pad           ; Atmospheric pad
+    rts
+
+@drop_mode:
+    ; DROP! Maximum energy
+    jsr update_drop_kick    ; Heavy kicks
+    jsr update_hihat
+    jsr update_bass
+    jsr update_lead
+    jsr update_arp
+    jsr update_acid         ; Layer acid too!
     rts
     
 @buildup_mode:
-    ; Buildup - add riser!
+    ; Buildup with riser
     jsr update_kick
     jsr update_riser
     jsr update_bass
     rts
 
+@minimal_mode:
+    ; Minimal - just kick and bass
+    jsr update_kick
+    jsr update_bass
+    rts
+
 ;------------------------------------------------------------------------------
-; Song Section Management
+; Song Section Management - 7 unique sections!
+;------------------------------------------------------------------------------
+; Section 0: Intro (normal)
+; Section 1: Acid mode
+; Section 2: Breakdown
+; Section 3: DROP!
+; Section 4: Peak (normal)
+; Section 5: Buildup/Riser
+; Section 6: Minimal
 ;------------------------------------------------------------------------------
 update_song_section:
-    ; Song structure every 8 bars
+    ; Song structure every 4 bars (faster changes!)
     lda bar_count
-    and #$07
+    and #$03
     bne @check_section
     
-    ; Every 8 bars, advance section
+    ; Every 4 bars, advance section
     inc song_section
     lda song_section
-    cmp #$05                ; 5 sections, then loop
+    cmp #$07                ; 7 sections, then loop
     bcc @section_ok
     lda #$00
     sta song_section
     ; Reset intensity for new cycle
     lda #$02
     sta intensity
+    ; Change groove variation
+    inc groove_var
     rts
     
 @section_ok:
+    ; DROP section (3) - set max intensity!
+    lda song_section
+    cmp #$03
+    bne @check_section
+    lda #$0F
+    sta intensity
+    
 @check_section:
     ; Increase intensity within section
-    lda bar_count
-    and #$01                ; Every 2 bars
+    lda frame_count
+    and #$3F                ; Every 64 frames
     bne @done
     lda intensity
     cmp #$0F
@@ -727,6 +778,124 @@ update_stutter:
     rts
 
 ;------------------------------------------------------------------------------
+; Acid Bass - 303-style with slides (Pulse 1)
+;------------------------------------------------------------------------------
+update_acid:
+    ; Fast note changes - every 8 frames
+    lda frame_count
+    and #$07
+    bne @acid_slide
+    
+    ; Get acid note
+    lda frame_count
+    lsr a
+    lsr a
+    lsr a
+    clc
+    adc groove_var          ; Variation
+    and #$0F                ; 16-note pattern
+    tax
+    lda acid_lo, x
+    sta APU_PULSE1_LO
+    lda acid_hi, x
+    sta APU_PULSE1_HI
+    
+    ; Accented notes on certain beats
+    lda frame_count
+    and #$1F
+    cmp #$00
+    beq @acid_accent
+    cmp #$0C
+    beq @acid_accent
+    
+    ; Normal acid note
+    lda #%00111011          ; 12.5% duty, vol 11
+    sta APU_PULSE1_CTRL
+    rts
+    
+@acid_accent:
+    ; ACCENT! Louder, different duty
+    lda #%01111111          ; 25% duty, vol 15
+    sta APU_PULSE1_CTRL
+    rts
+    
+@acid_slide:
+    ; Pitch slide effect - bend between notes
+    lda frame_count
+    and #$07
+    cmp #$04
+    bcc @acid_done
+    ; Slide up slightly
+    lda APU_PULSE1_LO
+    sec
+    sbc #$02                ; Pitch bend up
+    sta APU_PULSE1_LO
+    ; Quick decay
+    lda #%00110111          ; Vol 7
+    sta APU_PULSE1_CTRL
+@acid_done:
+    rts
+
+;------------------------------------------------------------------------------
+; Drop Kick - Extra heavy kick for drops
+;------------------------------------------------------------------------------
+update_drop_kick:
+    lda frame_count
+    and #$1F
+    
+    cmp #$00
+    bne @drop_decay
+    
+    ; MASSIVE KICK!
+    lda #%00111111          ; Vol 15
+    sta APU_NOISE_CTRL
+    lda #$01                ; Lowest pitch = deepest
+    sta APU_NOISE_FREQ
+    lda #$20                ; Long decay
+    sta APU_NOISE_LEN
+    rts
+    
+@drop_decay:
+    cmp #$01
+    bne @dd2
+    lda #%00111100          ; Vol 12
+    sta APU_NOISE_CTRL
+    lda #$02
+    sta APU_NOISE_FREQ
+    rts
+@dd2:
+    cmp #$02
+    bne @dd3
+    lda #%00111000          ; Vol 8
+    sta APU_NOISE_CTRL
+    rts
+@dd3:
+    cmp #$03
+    bne @dd4
+    lda #%00110100          ; Vol 4
+    sta APU_NOISE_CTRL
+    rts
+@dd4:
+    cmp #$04
+    bne @check_sub
+    lda #%00110000          ; Silent
+    sta APU_NOISE_CTRL
+    rts
+
+@check_sub:
+    ; Sub bass thump on frame 8 (layered with kick)
+    cmp #$08
+    bne @done
+    lda #%00111010          ; Vol 10
+    sta APU_NOISE_CTRL
+    lda #$00                ; Lowest pitch
+    sta APU_NOISE_FREQ
+    lda #$08
+    sta APU_NOISE_LEN
+@done:
+    rts
+
+;------------------------------------------------------------------------------
 ; IRQ Handler (not used)
 ;------------------------------------------------------------------------------
 IRQ:
@@ -847,6 +1016,42 @@ pad_hi:
     .byte $05               ; G2
     .byte $04               ; B2
     .byte $05               ; A2
+
+; Acid bass pattern - 16 notes, classic 303 style!
+acid_lo:
+    .byte $A9               ; E4
+    .byte $A9               ; E4
+    .byte $52               ; G4
+    .byte $A9               ; E4
+    .byte $00               ; A4
+    .byte $A9               ; E4
+    .byte $52               ; G4
+    .byte $00               ; A4
+    .byte $A9               ; E4
+    .byte $FD               ; B4
+    .byte $A9               ; E4
+    .byte $52               ; G4
+    .byte $D4               ; E5 (octave up!)
+    .byte $A9               ; E4
+    .byte $00               ; A4
+    .byte $52               ; G4
+acid_hi:
+    .byte $01               ; E4
+    .byte $01               ; E4
+    .byte $01               ; G4
+    .byte $01               ; E4
+    .byte $01               ; A4
+    .byte $01               ; E4
+    .byte $01               ; G4
+    .byte $01               ; A4
+    .byte $01               ; E4
+    .byte $00               ; B4
+    .byte $01               ; E4
+    .byte $01               ; G4
+    .byte $00               ; E5
+    .byte $01               ; E4
+    .byte $01               ; A4
+    .byte $01               ; G4
 
 ;------------------------------------------------------------------------------
 ; Vectors

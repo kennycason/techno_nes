@@ -58,6 +58,8 @@ vis_c:          .res 1      ; Coefficient C (rotation/twist)
 vis_d:          .res 1      ; Coefficient D (wave frequency)
 vis_pulse:      .res 1      ; Beat pulse (spikes on kick)
 vis_hue:        .res 1      ; Color cycling
+vis_phase2:     .res 1      ; Secondary phase (different speed)
+vis_wave:       .res 1      ; Wave offset (screen ripple effect)
 vis_temp:       .res 4      ; Temp vars for calculations
 tile_x:         .res 1      ; Current tile X position
 tile_y:         .res 1      ; Current tile Y position
@@ -335,9 +337,9 @@ update_tiles:
     ; Don't need to avoid attributes - they're at $23C0+, we'll rarely hit them
     sta PPU_ADDR
     
-    ; Morphing formula: (x + phase + a) XOR (y + b + c) + pulse
+    ; Morphing formula - simple and reliable
     
-    ; X component with phase animation
+    ; X component: position + phase + a
     lda frame_count
     clc
     adc vis_temp
@@ -347,23 +349,25 @@ update_tiles:
     adc vis_a
     sta vis_temp+1
     
-    ; Y component
+    ; Y component: position + phase2 + b
     lda frame_count+1
-    eor vis_temp            ; Mix it up
+    eor vis_temp
+    clc
+    adc vis_phase2          ; Use secondary phase here
     clc
     adc vis_b
+    
+    ; Simple XOR + c
+    eor vis_temp+1
     clc
     adc vis_c
     
-    ; XOR for interference pattern
-    eor vis_temp+1
-    
-    ; Beat pulse adds energy
+    ; Beat pulse
     clc
     adc vis_pulse
-    adc vis_pulse           ; Double pulse effect
+    adc vis_pulse
     
-    ; Ensure valid tile (1-31)
+    ; Ensure valid tile (1-31) - this is critical!
     and #$1F
     ora #$01
     
@@ -379,6 +383,24 @@ update_tiles:
 update_visual_params:
     ; Advance phase (main animation driver)
     inc vis_phase
+    
+    ; Secondary phase - moves at 3/4 speed for interesting interference
+    lda frame_count
+    and #$03
+    cmp #$03
+    beq @skip_phase2
+    inc vis_phase2
+@skip_phase2:
+
+    ; Wave offset - creates ripple across screen
+    lda frame_count
+    and #$07
+    bne @skip_wave
+    lda vis_wave
+    clc
+    adc #$03                ; Moves in steps of 3 (prime = less repetitive)
+    sta vis_wave
+@skip_wave:
     
     ; Morph coefficient A (slow sine-like motion)
     lda frame_count

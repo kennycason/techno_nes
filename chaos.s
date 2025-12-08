@@ -218,49 +218,6 @@ RESET:
 ; Main Loop - Simple
 ;------------------------------------------------------------------------------
 main_loop:
-    ; Read controller
-    jsr read_controller
-    
-    ; Check for RIGHT press (new press only)
-    lda buttons
-    and #BTN_RIGHT
-    beq @no_right
-    lda buttons_prev
-    and #BTN_RIGHT
-    bne @no_right           ; Already held, skip
-    ; RIGHT pressed - next mode
-    inc current_mode
-    lda current_mode
-    cmp #NUM_MODES
-    bcc @mode_ok
-    lda #$00
-    sta current_mode
-@mode_ok:
-    jmp @done_input
-    
-@no_right:
-    ; Check for LEFT press
-    lda buttons
-    and #BTN_LEFT
-    beq @no_left
-    lda buttons_prev
-    and #BTN_LEFT
-    bne @no_left
-    ; LEFT pressed - previous mode
-    lda current_mode
-    beq @wrap_mode
-    dec current_mode
-    jmp @done_input
-@wrap_mode:
-    lda #NUM_MODES-1
-    sta current_mode
-    
-@no_left:
-@done_input:
-    ; Save button state for next frame
-    lda buttons
-    sta buttons_prev
-    
     ; Update coefficients (simple version)
     inc coeff_a             ; Every frame
     
@@ -297,10 +254,47 @@ NMI:
     ; Increment phase for animations
     inc phase
     
-    ; Mode timer disabled - using manual D-pad control
-    ; (Mode switching now happens in main_loop via controller)
+    ; Read controller and handle mode switching (at start of NMI)
+    jsr read_controller
     
-@same_mode:
+    ; Check for RIGHT press (new press only)
+    lda buttons
+    and #BTN_RIGHT
+    beq @no_right
+    lda buttons_prev
+    and #BTN_RIGHT
+    bne @done_input         ; Already held
+    ; RIGHT pressed - next mode
+    inc current_mode
+    lda current_mode
+    cmp #NUM_MODES
+    bcc @done_input
+    lda #$00
+    sta current_mode
+    jmp @done_input
+    
+@no_right:
+    ; Check for LEFT press
+    lda buttons
+    and #BTN_LEFT
+    beq @done_input
+    lda buttons_prev
+    and #BTN_LEFT
+    bne @done_input
+    ; LEFT pressed - previous mode
+    lda current_mode
+    beq @wrap_mode
+    dec current_mode
+    jmp @done_input
+@wrap_mode:
+    lda #NUM_MODES-1
+    sta current_mode
+    
+@done_input:
+    ; Save button state
+    lda buttons
+    sta buttons_prev
+    
     ; Update palette FIRST (during vblank)
     jsr update_palette
     
@@ -987,13 +981,10 @@ random:
 ; Sine Table Lookup
 ;------------------------------------------------------------------------------
 get_sine:
-    ; Save X (used as loop counter in callers)
-    stx temp+7              ; Use last temp slot
+    ; Use Y register for lookup (doesn't affect X loop counter)
     and #$1F
-    tax
-    lda sine_table, x
-    ; Restore X
-    ldx temp+7
+    tay
+    lda sine_table, y
     rts
 
 ;------------------------------------------------------------------------------
@@ -1152,6 +1143,7 @@ fill_attributes:
 ; Update Pattern - Dispatch to current mode
 ;------------------------------------------------------------------------------
 update_pattern:
+    ; Use mode table for pattern selection
     lda current_mode
     asl a
     tax
@@ -1165,7 +1157,7 @@ update_pattern:
 ; Mode 0: XOR Fractal
 ;------------------------------------------------------------------------------
 mode_xor_fractal:
-    ldx #$30                ; Reduced to prevent NMI overrun
+    ldx #$10                ; Much smaller - only 16 tiles per frame
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1198,7 +1190,7 @@ mode_xor_fractal:
 ; Mode 1: Plasma
 ;------------------------------------------------------------------------------
 mode_plasma:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1240,7 +1232,7 @@ mode_plasma:
 ; Mode 2: Diagonal Waves
 ;------------------------------------------------------------------------------
 mode_diagonal:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1272,7 +1264,7 @@ mode_diagonal:
 ; Mode 3: Interference
 ;------------------------------------------------------------------------------
 mode_interference:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1309,7 +1301,7 @@ mode_interference:
 ; Mode 4: Sierpinski
 ;------------------------------------------------------------------------------
 mode_sierpinski:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1340,7 +1332,7 @@ mode_sierpinski:
 ; Mode 5: Ripple - Expanding circles
 ;------------------------------------------------------------------------------
 mode_ripple:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1388,7 +1380,7 @@ mode_ripple:
 ; Mode 6: Morphing Grid
 ;------------------------------------------------------------------------------
 mode_grid:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1433,7 +1425,7 @@ mode_grid:
 ; Mode 7: Chaos Rain
 ;------------------------------------------------------------------------------
 mode_chaos:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     jsr random
@@ -1459,7 +1451,7 @@ mode_chaos:
 ; Mode 8: Spiral
 ;------------------------------------------------------------------------------
 mode_spiral:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1500,7 +1492,7 @@ mode_spiral:
 ; Mode 9: Tunnel / Zoom
 ;------------------------------------------------------------------------------
 mode_tunnel:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1551,7 +1543,7 @@ mode_tunnel:
 ; Mode 10: Kaleidoscope
 ;------------------------------------------------------------------------------
 mode_kaleidoscope:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1605,7 +1597,7 @@ mode_kaleidoscope:
 ; Mode 11: Matrix Rain
 ;------------------------------------------------------------------------------
 mode_matrix:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1638,7 +1630,7 @@ mode_matrix:
 ; Mode 12: Starfield
 ;------------------------------------------------------------------------------
 mode_starfield:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1680,7 +1672,7 @@ mode_starfield:
 ; Mode 13: Cellular Automata
 ;------------------------------------------------------------------------------
 mode_cellular:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1712,7 +1704,7 @@ mode_cellular:
 ; Mode 14: Lissajous
 ;------------------------------------------------------------------------------
 mode_lissajous:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1761,7 +1753,7 @@ mode_lissajous:
 ; Mode 15: Warp / Vortex
 ;------------------------------------------------------------------------------
 mode_vortex:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1817,7 +1809,7 @@ mode_vortex:
 ; Mode 16: Pulse - Concentric rings radiating from center
 ;------------------------------------------------------------------------------
 mode_pulse:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1874,7 +1866,7 @@ mode_pulse:
 ; Mode 17: Diamond Wave - Diagonal stripes that create diamond patterns
 ;------------------------------------------------------------------------------
 mode_diamond:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -1924,7 +1916,7 @@ mode_diamond:
 ; Mode 18: Rings - Expanding circles from a bouncing center
 ;------------------------------------------------------------------------------
 mode_rings:
-    ldx #$30
+    ldx #$10
 @loop:
     bit PPU_STATUS
     lda #$20
@@ -2052,7 +2044,7 @@ update_attributes:
     eor coeff_a
     sta PPU_DATA
     inx
-    cpx #$40
+    cpx #$10                ; Only 16 attributes (was 64)
     bne @loop
     rts
 

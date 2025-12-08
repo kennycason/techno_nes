@@ -169,30 +169,89 @@ update_music:
     and #$0F                ; Every 16 beats = 1 bar
     bne @not_bar
     
-    ; New bar - advance bass pattern
+    ; New bar!
     inc bar_count
     
-    ; Every 4 bars, maybe change section
-    lda bar_count
-    and #$03
-    bne @not_bar
+    ; Update song section based on bar count
+    jsr update_song_section
     
-    ; Increase intensity
-    lda intensity
-    cmp #$0F
-    bcs @max_intensity
-    inc intensity
-@max_intensity:
 @not_bar:
 @not_beat:
 
-    ; Always update all sound components
+    ; Check if we're in breakdown
+    lda song_section
+    cmp #$02                ; Section 2 = breakdown
+    beq @breakdown_mode
+    cmp #$04                ; Section 4 = buildup/riser
+    beq @buildup_mode
+    
+    ; Normal mode - all elements
+    ; Check for fill beat (last beat of every 4 bars)
+    lda bar_count
+    and #$03
+    cmp #$03
+    bne @normal_kick
+    lda beat_count
+    and #$0F
+    cmp #$0E                ; Beats 14-15 = fill
+    bcc @normal_kick
+    jsr update_stutter      ; Stutter fill!
+    jmp @after_kick
+@normal_kick:
     jsr update_kick
+@after_kick:
     jsr update_hihat  
     jsr update_bass
     jsr update_lead
     jsr update_arp
+    rts
     
+@breakdown_mode:
+    ; Breakdown - just bass and minimal hats
+    jsr update_bass
+    jsr update_hihat
+    jsr update_pad           ; Atmospheric pad
+    rts
+    
+@buildup_mode:
+    ; Buildup - add riser!
+    jsr update_kick
+    jsr update_riser
+    jsr update_bass
+    rts
+
+;------------------------------------------------------------------------------
+; Song Section Management
+;------------------------------------------------------------------------------
+update_song_section:
+    ; Song structure every 8 bars
+    lda bar_count
+    and #$07
+    bne @check_section
+    
+    ; Every 8 bars, advance section
+    inc song_section
+    lda song_section
+    cmp #$05                ; 5 sections, then loop
+    bcc @section_ok
+    lda #$00
+    sta song_section
+    ; Reset intensity for new cycle
+    lda #$02
+    sta intensity
+    rts
+    
+@section_ok:
+@check_section:
+    ; Increase intensity within section
+    lda bar_count
+    and #$01                ; Every 2 bars
+    bne @done
+    lda intensity
+    cmp #$0F
+    bcs @done
+    inc intensity
+@done:
     rts
 
 ;------------------------------------------------------------------------------
@@ -329,11 +388,11 @@ update_hihat:
     rts
 
 ;------------------------------------------------------------------------------
-; Bass - Triangle channel, alternating patterns
+; Bass - Triangle channel, 3 alternating patterns
 ;------------------------------------------------------------------------------
 update_bass:
     lda frame_count
-    and #$0F                ; Every 16 frames = new note (faster!)
+    and #$0F                ; Every 16 frames = new note
     bne @sustain
     
     ; Get bass note from pattern
@@ -341,11 +400,29 @@ update_bass:
     and #$07                ; 8-note pattern
     tax
     
-    ; Which bass pattern? Changes every 8 bars
+    ; Which bass pattern? Changes every 4 bars
     lda bar_count
-    and #$08
-    beq @pattern1
+    lsr a
+    lsr a                   ; Divide by 4
+    and #$03                ; 0-3
     
+    cmp #$00
+    beq @pattern1
+    cmp #$01
+    beq @pattern2
+    cmp #$02
+    beq @pattern3
+    ; Fall through to pattern 1 for case 3
+    
+@pattern1:
+    ; Pattern 1 - driving root
+    lda bass_lo, x
+    sta APU_TRI_LO
+    lda bass_hi, x
+    sta APU_TRI_HI
+    jmp @enable
+    
+@pattern2:
     ; Pattern 2 - more melodic
     lda bass2_lo, x
     sta APU_TRI_LO
@@ -353,11 +430,11 @@ update_bass:
     sta APU_TRI_HI
     jmp @enable
     
-@pattern1:
-    ; Pattern 1 - driving root
-    lda bass_lo, x
+@pattern3:
+    ; Pattern 3 - syncopated
+    lda bass3_lo, x
     sta APU_TRI_LO
-    lda bass_hi, x
+    lda bass3_hi, x
     sta APU_TRI_HI
     
 @enable:
@@ -554,6 +631,102 @@ update_arp:
     rts
 
 ;------------------------------------------------------------------------------
+; Pad - Atmospheric sound for breakdowns (Pulse 1)
+;------------------------------------------------------------------------------
+update_pad:
+    ; Slow-evolving chord pad
+    lda frame_count
+    and #$3F                ; Every 64 frames = change note
+    bne @pad_sustain
+    
+    ; Get pad note
+    lda beat_count
+    lsr a
+    and #$03
+    tax
+    lda pad_lo, x
+    sta APU_PULSE1_LO
+    lda pad_hi, x
+    sta APU_PULSE1_HI
+    
+    ; Soft attack
+    lda #%11110100          ; 75% duty (warmer), vol 4
+    sta APU_PULSE1_CTRL
+    rts
+    
+@pad_sustain:
+    ; Slow swell
+    lda frame_count
+    and #$1F
+    lsr a
+    lsr a                   ; 0-7
+    clc
+    adc #$02                ; 2-9
+    ora #%11110000          ; 75% duty
+    sta APU_PULSE1_CTRL
+    rts
+
+;------------------------------------------------------------------------------
+; Riser - Building noise sweep for drops
+;------------------------------------------------------------------------------
+update_riser:
+    ; Noise pitch rises over bar
+    lda frame_count
+    and #$07                ; Every 8 frames
+    bne @riser_sustain
+    
+    ; Calculate pitch based on position in section
+    lda beat_count
+    and #$0F                ; 0-15 within bar
+    eor #$0F                ; Invert: 15-0 (pitch goes UP)
+    sta APU_NOISE_FREQ
+    
+    ; Volume builds up
+    lda beat_count
+    and #$0F
+    lsr a                   ; 0-7
+    clc
+    adc #$08                ; 8-15
+    ora #%00110000
+    sta APU_NOISE_CTRL
+    lda #$08
+    sta APU_NOISE_LEN
+    
+@riser_sustain:
+    rts
+
+;------------------------------------------------------------------------------
+; Stutter Kick - Rapid kicks for fills
+;------------------------------------------------------------------------------
+update_stutter:
+    ; Only on specific beats
+    lda beat_count
+    and #$0F
+    cmp #$0F                ; Last beat of bar
+    bne @no_stutter
+    
+    ; Rapid kicks every 4 frames
+    lda frame_count
+    and #$03
+    bne @stutter_decay
+    
+    lda #%00111101          ; Vol 13
+    sta APU_NOISE_CTRL
+    lda #$03                ; Medium-low pitch
+    sta APU_NOISE_FREQ
+    lda #$10
+    sta APU_NOISE_LEN
+    rts
+    
+@stutter_decay:
+    lda #%00110100          ; Vol 4
+    sta APU_NOISE_CTRL
+    rts
+    
+@no_stutter:
+    rts
+
+;------------------------------------------------------------------------------
 ; IRQ Handler (not used)
 ;------------------------------------------------------------------------------
 IRQ:
@@ -589,6 +762,19 @@ bass2_lo:
     .byte $9D               ; E2
 bass2_hi:
     .byte $05, $05, $05, $05, $04, $05, $05, $05
+
+; Bass Pattern 3 - syncopated funk
+bass3_lo:
+    .byte $9D               ; E2
+    .byte $9D               ; E2
+    .byte $4C               ; G2
+    .byte $4C               ; G2
+    .byte $00               ; A2
+    .byte $F8               ; B2
+    .byte $00               ; A2
+    .byte $4C               ; G2
+bass3_hi:
+    .byte $05, $05, $05, $05, $05, $04, $05, $05
 
 ; Lead frequencies - E minor chord tones (8 notes)
 lead_lo:
@@ -649,6 +835,18 @@ arp2_hi:
     .byte $00               ; A5
     .byte $00               ; B4
     .byte $00               ; E5
+
+; Pad notes - slow chord tones (lower octave)
+pad_lo:
+    .byte $9D               ; E2
+    .byte $4C               ; G2
+    .byte $F8               ; B2
+    .byte $00               ; A2
+pad_hi:
+    .byte $05               ; E2
+    .byte $05               ; G2
+    .byte $04               ; B2
+    .byte $05               ; A2
 
 ;------------------------------------------------------------------------------
 ; Vectors

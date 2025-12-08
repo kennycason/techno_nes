@@ -36,8 +36,12 @@ beat_count:     .res 1      ; Beat counter (for pattern changes)
 bar_count:      .res 1      ; Bar counter (for song structure)
 song_section:   .res 1      ; Current section (intro, build, drop, etc)
 bass_note:      .res 1      ; Current bass note index
+bass_pattern:   .res 1      ; Which bass pattern (0 or 1)
 arp_note:       .res 1      ; Current arp note index
+arp_pattern:    .res 1      ; Which arp pattern
 intensity:      .res 1      ; Builds up over time
+hat_pattern:    .res 1      ; Hi-hat pattern variation
+lead_duty:      .res 1      ; Lead duty cycle for filter sweep
 
 ;------------------------------------------------------------------------------
 ; iNES Header
@@ -192,25 +196,45 @@ update_music:
     rts
 
 ;------------------------------------------------------------------------------
-; Kick Drum - 4 on the floor
+; Kick & Snare - 4 on the floor with backbeat snare
 ;------------------------------------------------------------------------------
 update_kick:
     lda frame_count
     and #$1F                ; Every 32 frames
     
     cmp #$00
-    bne @kick_decay
+    bne @check_snare
     
     ; KICK HIT!
-    lda #%00111111          ; Vol 15, no loop
+    lda #%00111111          ; Vol 15
     sta APU_NOISE_CTRL
     lda #$02                ; Low pitch for deep kick
     sta APU_NOISE_FREQ
-    lda #$18                ; Length
+    lda #$18
+    sta APU_NOISE_LEN
+    rts
+    
+@check_snare:
+    cmp #$10                ; Frame 16 = snare (offbeat)
+    bne @kick_decay
+    
+    ; Check if snare should play (only after some intensity)
+    lda intensity
+    cmp #$02
+    bcc @kick_decay
+    
+    ; SNARE HIT!
+    lda #%00111100          ; Vol 12
+    sta APU_NOISE_CTRL
+    lda #$06                ; Medium-high pitch
+    sta APU_NOISE_FREQ
+    lda #$10
     sta APU_NOISE_LEN
     rts
     
 @kick_decay:
+    lda frame_count
+    and #$1F
     cmp #$01
     bne @decay2
     lda #%00111010          ; Vol 10
@@ -224,45 +248,92 @@ update_kick:
     rts
 @decay3:
     cmp #$03
-    bne @silent
+    bne @snare_decay
     lda #%00110000          ; Vol 0
     sta APU_NOISE_CTRL
-@silent:
     rts
-
-;------------------------------------------------------------------------------
-; Hi-hat - offbeat
-;------------------------------------------------------------------------------
-update_hihat:
-    lda frame_count
-    and #$1F
     
-    cmp #$10                ; Frame 16 = offbeat
-    bne @hat_silent
-    
-    ; HI-HAT!
+@snare_decay:
+    ; Snare decay at frames 17-19
+    cmp #$11
+    bne @sd2
     lda #%00111000          ; Vol 8
     sta APU_NOISE_CTRL
-    lda #$0F                ; High pitch
-    sta APU_NOISE_FREQ
-    lda #$08
-    sta APU_NOISE_LEN
     rts
-    
-@hat_silent:
-    cmp #$11
+@sd2:
+    cmp #$12
+    bne @sd3
+    lda #%00110100          ; Vol 4
+    sta APU_NOISE_CTRL
+    rts
+@sd3:
+    cmp #$13
     bne @done
-    lda #%00110000          ; Silence
+    lda #%00110000          ; Vol 0
     sta APU_NOISE_CTRL
 @done:
     rts
 
 ;------------------------------------------------------------------------------
-; Bass - Triangle channel, 8-note pattern
+; Hi-hat - 16th note pattern (evolves with intensity)
+;------------------------------------------------------------------------------
+update_hihat:
+    ; Different patterns based on intensity
+    lda intensity
+    cmp #$06
+    bcs @fast_hats          ; Fast 16ths at high intensity
+    cmp #$03
+    bcs @medium_hats        ; 8th notes at medium
+    
+    ; Slow hats - just offbeat
+    lda frame_count
+    and #$1F
+    cmp #$08                ; Frame 8 only
+    beq @play_hat
+    rts
+    
+@medium_hats:
+    ; 8th note hats
+    lda frame_count
+    and #$0F                ; Every 16 frames
+    cmp #$08
+    beq @play_hat
+    rts
+    
+@fast_hats:
+    ; 16th note hats (every 8 frames)
+    lda frame_count
+    and #$07
+    cmp #$04
+    beq @play_hat
+    cmp #$00
+    beq @play_accent_hat    ; Accent on downbeat
+    rts
+    
+@play_accent_hat:
+    lda #%00111010          ; Vol 10 (accent)
+    sta APU_NOISE_CTRL
+    lda #$0E                ; High pitch
+    sta APU_NOISE_FREQ
+    lda #$08
+    sta APU_NOISE_LEN
+    rts
+    
+@play_hat:
+    lda #%00110110          ; Vol 6
+    sta APU_NOISE_CTRL
+    lda #$0F                ; Highest pitch
+    sta APU_NOISE_FREQ
+    lda #$04
+    sta APU_NOISE_LEN
+    rts
+
+;------------------------------------------------------------------------------
+; Bass - Triangle channel, alternating patterns
 ;------------------------------------------------------------------------------
 update_bass:
     lda frame_count
-    and #$1F                ; Every 32 frames = new note
+    and #$0F                ; Every 16 frames = new note (faster!)
     bne @sustain
     
     ; Get bass note from pattern
@@ -270,12 +341,26 @@ update_bass:
     and #$07                ; 8-note pattern
     tax
     
-    ; Set triangle frequency
+    ; Which bass pattern? Changes every 8 bars
+    lda bar_count
+    and #$08
+    beq @pattern1
+    
+    ; Pattern 2 - more melodic
+    lda bass2_lo, x
+    sta APU_TRI_LO
+    lda bass2_hi, x
+    sta APU_TRI_HI
+    jmp @enable
+    
+@pattern1:
+    ; Pattern 1 - driving root
     lda bass_lo, x
     sta APU_TRI_LO
     lda bass_hi, x
     sta APU_TRI_HI
     
+@enable:
     ; Enable triangle
     lda #%11111111
     sta APU_TRI_CTRL
@@ -284,42 +369,83 @@ update_bass:
     rts
 
 ;------------------------------------------------------------------------------
-; Lead Synth - Pulse 1, chord stabs
+; Lead Synth - Pulse 1, chord stabs with filter sweep
 ;------------------------------------------------------------------------------
 update_lead:
-    ; Only play on certain beats (every 4 beats)
+    ; Only play after some intensity
+    lda intensity
+    cmp #$03
+    bcc @lead_off
+    
+    ; Different patterns based on bar
+    lda bar_count
+    and #$03
+    cmp #$03
+    beq @lead_fill          ; Every 4th bar = fill
+    
+    ; Normal: play on certain beats
     lda beat_count
     and #$03
-    bne @lead_off
+    bne @lead_sustain
     
     lda frame_count
     and #$1F
-    cmp #$04                ; Stab on frame 4 of beat
-    bne @lead_decay
+    cmp #$04                ; Stab on frame 4
+    bne @lead_sustain
     
-    ; STAB!
+    ; STAB! Get note from pattern
     lda beat_count
     lsr a
     lsr a
-    and #$03
+    clc
+    adc bar_count           ; Add variation over time
+    and #$07                ; 8 notes
     tax
     lda lead_lo, x
     sta APU_PULSE1_LO
     lda lead_hi, x
     sta APU_PULSE1_HI
-    lda #%10111111          ; 50% duty, vol 15
+    
+    ; Duty cycle changes based on intensity (filter sweep effect)
+    lda intensity
+    and #$03
+    asl a
+    asl a
+    asl a
+    asl a
+    asl a
+    asl a                   ; Shift to bits 6-7
+    ora #%00111111          ; Vol 15
     sta APU_PULSE1_CTRL
     rts
     
-@lead_decay:
+@lead_fill:
+    ; Fill pattern - rapid notes
     lda frame_count
-    and #$1F
-    cmp #$08
+    and #$07                ; Every 8 frames
+    bne @lead_sustain
+    
+    lda frame_count
+    lsr a
+    lsr a
+    lsr a
+    and #$07
+    tax
+    lda lead_lo, x
+    sta APU_PULSE1_LO
+    lda lead_hi, x
+    sta APU_PULSE1_HI
+    lda #%01111110          ; 25% duty, vol 14
+    sta APU_PULSE1_CTRL
+    rts
+    
+@lead_sustain:
+    ; Quick decay
+    lda frame_count
+    and #$07
+    cmp #$03
     bcc @done
-    cmp #$10
-    bcs @lead_off
-    ; Decay
-    lda #%10111000          ; Vol 8
+    lda #%10110100          ; Vol 4
     sta APU_PULSE1_CTRL
     rts
     
@@ -330,52 +456,101 @@ update_lead:
     rts
 
 ;------------------------------------------------------------------------------
-; Arpeggio - Pulse 2, fast notes
+; Arpeggio - Pulse 2, evolving patterns
 ;------------------------------------------------------------------------------
 update_arp:
-    ; Arp speed based on intensity
+    ; Arp only after buildup
     lda intensity
-    cmp #$04                ; Only play arp after some buildup
+    cmp #$04
     bcc @arp_off
     
-    ; Fast arp - every 4 frames
+    ; Arp speed varies with intensity
+    lda intensity
+    cmp #$08
+    bcs @super_fast_arp
+    cmp #$06
+    bcs @fast_arp
+    
+    ; Normal arp - every 4 frames
     lda frame_count
     and #$03
     bne @arp_sustain
+    jmp @play_arp
     
-    ; Get note from arp pattern
+@fast_arp:
+    ; Fast arp - every 3 frames
+    lda frame_count
+    and #$03
+    cmp #$03
+    beq @arp_sustain
+    jmp @play_arp
+    
+@super_fast_arp:
+    ; Super fast - every 2 frames!
+    lda frame_count
+    and #$01
+    bne @arp_sustain
+    
+@play_arp:
+    ; Which arp pattern?
+    lda bar_count
+    and #$04
+    beq @arp_pattern1
+    
+    ; Pattern 2 - different notes
     lda frame_count
     lsr a
     lsr a
-    and #$07                ; 8-note pattern
+    and #$07
     tax
+    lda arp2_lo, x
+    sta APU_PULSE2_LO
+    lda arp2_hi, x
+    sta APU_PULSE2_HI
+    jmp @arp_vol
     
+@arp_pattern1:
+    ; Pattern 1
+    lda frame_count
+    lsr a
+    lsr a
+    and #$07
+    tax
     lda arp_lo, x
     sta APU_PULSE2_LO
     lda arp_hi, x
     sta APU_PULSE2_HI
     
-    ; Volume based on intensity
+@arp_vol:
+    ; Volume and duty based on beat position
+    lda frame_count
+    and #$1F
+    cmp #$10
+    bcs @arp_quiet
+    
+    ; Louder on first half of beat
     lda intensity
-    lsr a                   ; 0-7
-    ora #%01111000          ; 25% duty + volume
+    lsr a
+    clc
+    adc #$08                ; 8-15
+    and #$0F
+    ora #%01110000          ; 25% duty
+    sta APU_PULSE2_CTRL
+    rts
+    
+@arp_quiet:
+    lda #%01110110          ; Vol 6
     sta APU_PULSE2_CTRL
     rts
     
 @arp_sustain:
-    ; Quick decay
-    lda frame_count
-    and #$03
-    cmp #$02
-    bcc @done
-    lda #%01110011          ; Vol 3
+    lda #%01110010          ; Vol 2
     sta APU_PULSE2_CTRL
     rts
     
 @arp_off:
     lda #%01110000          ; Vol 0
     sta APU_PULSE2_CTRL
-@done:
     rts
 
 ;------------------------------------------------------------------------------
@@ -389,57 +564,91 @@ IRQ:
 ;------------------------------------------------------------------------------
 .segment "RODATA"
 
-; Bass frequencies - E minor groove
+; Bass frequencies - E minor groove (Pattern 1 - driving)
 bass_lo:
     .byte $9D               ; E2
     .byte $9D               ; E2  
+    .byte $9D               ; E2
+    .byte $9D               ; E2
+    .byte $9D               ; E2
     .byte $4C               ; G2
     .byte $9D               ; E2
+    .byte $9D               ; E2
+bass_hi:
+    .byte $05, $05, $05, $05, $05, $05, $05, $05
+
+; Bass Pattern 2 - more melodic
+bass2_lo:
+    .byte $9D               ; E2
+    .byte $4C               ; G2
     .byte $00               ; A2
     .byte $9D               ; E2
-    .byte $4C               ; G2
     .byte $F8               ; B2
-bass_hi:
-    .byte $05               ; E2
-    .byte $05               ; E2
-    .byte $05               ; G2
-    .byte $05               ; E2
-    .byte $05               ; A2
-    .byte $05               ; E2
-    .byte $05               ; G2
-    .byte $04               ; B2
+    .byte $00               ; A2
+    .byte $4C               ; G2
+    .byte $9D               ; E2
+bass2_hi:
+    .byte $05, $05, $05, $05, $04, $05, $05, $05
 
-; Lead frequencies - E minor chord tones
+; Lead frequencies - E minor chord tones (8 notes)
 lead_lo:
     .byte $A9               ; E4
     .byte $52               ; G4
     .byte $FD               ; B3
     .byte $A9               ; E4
+    .byte $52               ; G4
+    .byte $00               ; A4
+    .byte $FD               ; B3
+    .byte $D4               ; E3
 lead_hi:
     .byte $01               ; E4
     .byte $01               ; G4
     .byte $01               ; B3
     .byte $01               ; E4
+    .byte $01               ; G4
+    .byte $01               ; A4
+    .byte $01               ; B3
+    .byte $02               ; E3
 
-; Arp frequencies - E minor pentatonic
+; Arp Pattern 1 - ascending/descending
 arp_lo:
     .byte $A9               ; E4
     .byte $52               ; G4
     .byte $00               ; A4
     .byte $FD               ; B4
-    .byte $52               ; G4
-    .byte $A9               ; E4
-    .byte $00               ; A4
+    .byte $D4               ; E5
     .byte $FD               ; B4
+    .byte $00               ; A4
+    .byte $52               ; G4
 arp_hi:
     .byte $01               ; E4
     .byte $01               ; G4
     .byte $01               ; A4
     .byte $00               ; B4
-    .byte $01               ; G4
-    .byte $01               ; E4
-    .byte $01               ; A4
+    .byte $00               ; E5
     .byte $00               ; B4
+    .byte $01               ; A4
+    .byte $01               ; G4
+
+; Arp Pattern 2 - octave jumps
+arp2_lo:
+    .byte $A9               ; E4
+    .byte $D4               ; E5
+    .byte $52               ; G4
+    .byte $A9               ; G5
+    .byte $00               ; A4
+    .byte $00               ; A5 (approximated)
+    .byte $FD               ; B4
+    .byte $D4               ; E5
+arp2_hi:
+    .byte $01               ; E4
+    .byte $00               ; E5
+    .byte $01               ; G4
+    .byte $00               ; G5
+    .byte $01               ; A4
+    .byte $00               ; A5
+    .byte $00               ; B4
+    .byte $00               ; E5
 
 ;------------------------------------------------------------------------------
 ; Vectors

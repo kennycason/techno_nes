@@ -254,7 +254,7 @@ init_nametable:
     rts
 
 ;------------------------------------------------------------------------------
-; Update Palette - Cycle colors based on vis_hue
+; Update Palette - Cycle colors, respond to music
 ;------------------------------------------------------------------------------
 update_palette_cycle:
     bit PPU_STATUS
@@ -263,26 +263,35 @@ update_palette_cycle:
     lda #$01                ; Start at color 1
     sta PPU_ADDR
     
-    ; Color 1 - cycles with hue
+    ; Color 1 - base hue, brightens on beat
     lda vis_hue
-    and #$0C
-    ora #$11
+    and #$0C                ; Hue (0, 4, 8, C)
+    clc
+    adc vis_pulse           ; Brighter on beat!
+    and #$0F                ; Keep in range
+    cmp #$0D                ; Avoid grays
+    bcc @c1_ok
+    lda #$0C
+@c1_ok:
+    ora #$10                ; Medium brightness
     sta PPU_DATA
     
-    ; Color 2 - offset
+    ; Color 2 - offset hue, tracks intensity
     lda vis_hue
     clc
     adc #$04
+    clc
+    adc song_section        ; Changes with section!
     and #$0C
-    ora #$21
+    ora #$20                ; Brighter
     sta PPU_DATA
     
-    ; Color 3 - another offset
+    ; Color 3 - complementary, pulses
     lda vis_hue
     clc
     adc #$08
     and #$0C
-    ora #$31
+    ora #$30                ; Brightest
     sta PPU_DATA
     rts
 
@@ -365,57 +374,90 @@ update_tiles:
     rts
 
 ;------------------------------------------------------------------------------
-; Update Visual Parameters - Morph coefficients, sync to beat
+; Update Visual Parameters - Smooth morphing, sync to beat
 ;------------------------------------------------------------------------------
 update_visual_params:
-    ; Advance phase
+    ; Advance phase (main animation driver)
     inc vis_phase
     
-    ; Morph coefficient A (slow)
+    ; Morph coefficient A (slow sine-like motion)
     lda frame_count
     and #$07
     bne @skip_a
+    ; A oscillates: inc for 128 frames, dec for 128 frames
+    lda frame_count+1
+    and #$01
+    beq @a_up
+    dec vis_a
+    jmp @skip_a
+@a_up:
     inc vis_a
 @skip_a:
 
-    ; Morph coefficient B (medium)
+    ; Morph coefficient B (different rate)
     lda frame_count
-    and #$0F
+    and #$0B                ; Every 12 frames (different rhythm)
     bne @skip_b
     inc vis_b
-    inc vis_b               ; Faster
 @skip_b:
 
-    ; Morph coefficient C (slow, reverse)
+    ; Morph coefficient C (slowest, adds drift)
     lda frame_count
     and #$1F
     bne @skip_c
+    ; C direction changes with song section
+    lda song_section
+    and #$01
+    beq @c_up
     dec vis_c
+    jmp @skip_c
+@c_up:
+    inc vis_c
 @skip_c:
 
-    ; Morph coefficient D based on section
-    lda song_section
+    ; Coefficient D tracks intensity (music energy)
+    lda intensity
     sta vis_d
     
-    ; Update hue (color cycling)
+    ; Update hue - faster during high intensity sections
+    lda intensity
+    cmp #$08
+    bcc @slow_hue
+    ; Fast hue cycling
+    lda frame_count
+    and #$01
+    bne @skip_hue
+    inc vis_hue
+    jmp @skip_hue
+@slow_hue:
     lda frame_count
     and #$03
     bne @skip_hue
     inc vis_hue
 @skip_hue:
 
-    ; Beat pulse - spike on kick, decay
+    ; Beat pulse - spike on kick, smooth decay
     lda frame_count
     and #$1F
     cmp #$00                ; On kick
     bne @pulse_decay
-    ; KICK! Spike the pulse
+    ; KICK! Spike the pulse (bigger during drops)
+    lda song_section
+    cmp #$06                ; Drop section
+    bne @normal_pulse
+    lda #$0C                ; Bigger pulse on drop
+    jmp @set_pulse
+@normal_pulse:
     lda #$08
+@set_pulse:
     sta vis_pulse
     rts
     
 @pulse_decay:
-    ; Decay pulse
+    ; Smooth decay (every 4 frames)
+    lda frame_count
+    and #$03
+    bne @pulse_done
     lda vis_pulse
     beq @pulse_done
     dec vis_pulse

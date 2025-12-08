@@ -8,6 +8,9 @@
 PPU_CTRL         = $2000
 PPU_MASK         = $2001
 PPU_STATUS       = $2002
+PPU_SCROLL       = $2005
+PPU_ADDR         = $2006
+PPU_DATA         = $2007
 
 ; APU Registers
 APU_PULSE1_CTRL  = $4000
@@ -46,6 +49,18 @@ acid_note:      .res 1      ; Current acid bass note
 acid_slide:     .res 1      ; Slide target
 drop_timer:     .res 1      ; For drop impact effect
 groove_var:     .res 1      ; Groove variation
+
+; Visual engine parameters - all morph smoothly
+vis_phase:      .res 1      ; Main animation phase
+vis_a:          .res 1      ; Coefficient A (X scale)
+vis_b:          .res 1      ; Coefficient B (Y scale)  
+vis_c:          .res 1      ; Coefficient C (rotation/twist)
+vis_d:          .res 1      ; Coefficient D (wave frequency)
+vis_pulse:      .res 1      ; Beat pulse (spikes on kick)
+vis_hue:        .res 1      ; Color cycling
+vis_temp:       .res 4      ; Temp vars for calculations
+tile_x:         .res 1      ; Current tile X position
+tile_y:         .res 1      ; Current tile Y position
 
 ;------------------------------------------------------------------------------
 ; iNES Header
@@ -118,12 +133,32 @@ RESET:
     sta APU_PULSE1_SWEEP
     sta APU_PULSE2_SWEEP
 
+    ; Initialize visual parameters
+    lda #$10
+    sta vis_a
+    lda #$08
+    sta vis_b
+    lda #$04
+    sta vis_c
+    lda #$02
+    sta vis_d
+    lda #$00
+    sta vis_phase
+    sta vis_pulse
+    sta vis_hue
+    
+    ; Load initial palette
+    jsr load_palette
+    
+    ; Fill nametable with initial tiles
+    jsr init_nametable
+    
     ; Enable NMI
     lda #%10000000
     sta PPU_CTRL
     
-    ; Keep screen black (no rendering)
-    lda #$00
+    ; Enable rendering (background on)
+    lda #%00001010          ; Show background
     sta PPU_MASK
 
 ;------------------------------------------------------------------------------
@@ -133,7 +168,7 @@ main_loop:
     jmp main_loop
 
 ;------------------------------------------------------------------------------
-; NMI Handler - Music engine runs here
+; NMI Handler - Visuals first (in vblank), then music
 ;------------------------------------------------------------------------------
 NMI:
     pha
@@ -148,8 +183,20 @@ NMI:
     inc frame_count+1
 @no_wrap:
 
-    ; Update music
+    ; === VISUALS (during vblank) ===
+    jsr update_palette_cycle
+    jsr update_tiles        ; Safe: only 12 tiles per frame
+    
+    ; Reset scroll
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    
+    ; === MUSIC (after vblank work) ===
     jsr update_music
+    
+    ; === Update visual parameters (sync to music) ===
+    jsr update_visual_params
 
     pla
     tay
@@ -157,6 +204,227 @@ NMI:
     tax
     pla
     rti
+
+;==============================================================================
+; VISUAL ENGINE - Safe, parameterized rendering
+;==============================================================================
+
+;------------------------------------------------------------------------------
+; Load Palette
+;------------------------------------------------------------------------------
+load_palette:
+    bit PPU_STATUS
+    lda #$3F
+    sta PPU_ADDR
+    lda #$00
+    sta PPU_ADDR
+    
+    ; Background palette - dark blues/purples
+    ldx #$00
+@pal_loop:
+    lda initial_palette, x
+    sta PPU_DATA
+    inx
+    cpx #$20
+    bne @pal_loop
+    rts
+
+;------------------------------------------------------------------------------
+; Initialize Nametable with gradient
+;------------------------------------------------------------------------------
+init_nametable:
+    bit PPU_STATUS
+    lda #$20
+    sta PPU_ADDR
+    lda #$00
+    sta PPU_ADDR
+    
+    ; Fill with simple gradient pattern
+    ldx #$00
+    ldy #$04                ; 4 pages = 1024 bytes
+@fill_loop:
+    txa
+    and #$1F
+    ora #$01                ; Tiles 1-31
+    sta PPU_DATA
+    inx
+    bne @fill_loop
+    dey
+    bne @fill_loop
+    rts
+
+;------------------------------------------------------------------------------
+; Update Palette - Cycle colors based on vis_hue
+;------------------------------------------------------------------------------
+update_palette_cycle:
+    bit PPU_STATUS
+    lda #$3F
+    sta PPU_ADDR
+    lda #$01                ; Start at color 1
+    sta PPU_ADDR
+    
+    ; Color 1 - cycles with hue
+    lda vis_hue
+    and #$0C
+    ora #$11
+    sta PPU_DATA
+    
+    ; Color 2 - offset
+    lda vis_hue
+    clc
+    adc #$04
+    and #$0C
+    ora #$21
+    sta PPU_DATA
+    
+    ; Color 3 - another offset
+    lda vis_hue
+    clc
+    adc #$08
+    and #$0C
+    ora #$31
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Update Tiles - The core visual engine (SAFE: only 16 tiles/frame)
+; Nametable is $2000-$23BF (960 tiles, 32x30)
+;------------------------------------------------------------------------------
+update_tiles:
+    ldx #$10                ; 16 tiles per frame
+@tile_loop:
+    bit PPU_STATUS
+    stx vis_temp            ; Save loop counter
+    
+    ; Generate pseudo-random offset 0-959 using frame + loop counter
+    ; We'll use: offset = (frame*17 + x*59) mod 960
+    ; Simplified: just spread across all 4 pages
+    
+    ; High byte ($20, $21, $22, $23) - changes based on frame + x
+    lda frame_count
+    lsr a
+    lsr a                   ; Slow down page changes
+    clc
+    adc vis_temp            ; Add loop counter
+    and #$03                ; 0-3
+    clc
+    adc #$20                ; $20-$23
+    sta vis_temp+1          ; Save high byte
+    sta PPU_ADDR
+    
+    ; Low byte - spread across 256 positions per page
+    lda frame_count
+    asl a
+    asl a
+    asl a                   ; * 8
+    clc
+    adc vis_temp
+    adc vis_temp
+    adc vis_temp            ; + x * 3
+    clc
+    adc frame_count+1       ; More variation
+    ; Don't need to avoid attributes - they're at $23C0+, we'll rarely hit them
+    sta PPU_ADDR
+    
+    ; Morphing formula: (x + phase + a) XOR (y + b + c) + pulse
+    
+    ; X component with phase animation
+    lda frame_count
+    clc
+    adc vis_temp
+    clc
+    adc vis_phase
+    clc
+    adc vis_a
+    sta vis_temp+1
+    
+    ; Y component
+    lda frame_count+1
+    eor vis_temp            ; Mix it up
+    clc
+    adc vis_b
+    clc
+    adc vis_c
+    
+    ; XOR for interference pattern
+    eor vis_temp+1
+    
+    ; Beat pulse adds energy
+    clc
+    adc vis_pulse
+    adc vis_pulse           ; Double pulse effect
+    
+    ; Ensure valid tile (1-31)
+    and #$1F
+    ora #$01
+    
+    sta PPU_DATA
+    
+    dex
+    bne @tile_loop
+    rts
+
+;------------------------------------------------------------------------------
+; Update Visual Parameters - Morph coefficients, sync to beat
+;------------------------------------------------------------------------------
+update_visual_params:
+    ; Advance phase
+    inc vis_phase
+    
+    ; Morph coefficient A (slow)
+    lda frame_count
+    and #$07
+    bne @skip_a
+    inc vis_a
+@skip_a:
+
+    ; Morph coefficient B (medium)
+    lda frame_count
+    and #$0F
+    bne @skip_b
+    inc vis_b
+    inc vis_b               ; Faster
+@skip_b:
+
+    ; Morph coefficient C (slow, reverse)
+    lda frame_count
+    and #$1F
+    bne @skip_c
+    dec vis_c
+@skip_c:
+
+    ; Morph coefficient D based on section
+    lda song_section
+    sta vis_d
+    
+    ; Update hue (color cycling)
+    lda frame_count
+    and #$03
+    bne @skip_hue
+    inc vis_hue
+@skip_hue:
+
+    ; Beat pulse - spike on kick, decay
+    lda frame_count
+    and #$1F
+    cmp #$00                ; On kick
+    bne @pulse_decay
+    ; KICK! Spike the pulse
+    lda #$08
+    sta vis_pulse
+    rts
+    
+@pulse_decay:
+    ; Decay pulse
+    lda vis_pulse
+    beq @pulse_done
+    dec vis_pulse
+@pulse_done:
+    rts
+
+;------------------------------------------------------------------------------
+; MUSIC ENGINE
+;------------------------------------------------------------------------------
 
 ;------------------------------------------------------------------------------
 ; Main Music Update - called every frame (60fps)
@@ -915,6 +1183,19 @@ IRQ:
 ;------------------------------------------------------------------------------
 .segment "RODATA"
 
+; Initial palette - dark/moody colors
+initial_palette:
+    ; Background palettes
+    .byte $0F, $11, $21, $31  ; Palette 0: black, blue shades
+    .byte $0F, $14, $24, $34  ; Palette 1: black, purple shades
+    .byte $0F, $19, $29, $39  ; Palette 2: black, green shades
+    .byte $0F, $12, $22, $32  ; Palette 3: black, blue-purple
+    ; Sprite palettes (unused but needed)
+    .byte $0F, $11, $21, $31
+    .byte $0F, $14, $24, $34
+    .byte $0F, $19, $29, $39
+    .byte $0F, $12, $22, $32
+
 ; Bass frequencies - E minor groove (Pattern 1 - driving)
 bass_lo:
     .byte $9D               ; E2
@@ -1071,8 +1352,84 @@ acid_hi:
     .word IRQ
 
 ;------------------------------------------------------------------------------
-; CHR ROM - Empty (no graphics needed)
+; CHR ROM - Gradient and pattern tiles
 ;------------------------------------------------------------------------------
 .segment "CHARS"
-    .res 8192, $00          ; 8KB of empty tiles
+
+; Tile 0: Empty (transparent)
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tiles 1-8: Gradient fills (light to dark)
+.byte $00,$00,$00,$00,$00,$00,$00,$00  ; Tile 1: Empty
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF  ; Tile 2: Solid
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $55,$AA,$55,$AA,$55,$AA,$55,$AA  ; Tile 3: Checkerboard
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $FF,$00,$FF,$00,$FF,$00,$FF,$00  ; Tile 4: Horizontal stripes
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $AA,$AA,$AA,$AA,$AA,$AA,$AA,$AA  ; Tile 5: Vertical stripes
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $81,$42,$24,$18,$18,$24,$42,$81  ; Tile 6: X pattern
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $18,$24,$42,$81,$81,$42,$24,$18  ; Tile 7: Diamond
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $3C,$42,$81,$81,$81,$81,$42,$3C  ; Tile 8: Circle
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tiles 9-16: Dither patterns
+.byte $11,$22,$44,$88,$11,$22,$44,$88  ; Tile 9: Diagonal lines
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $88,$44,$22,$11,$88,$44,$22,$11  ; Tile 10: Diagonal other way
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $F0,$F0,$F0,$F0,$0F,$0F,$0F,$0F  ; Tile 11: Half and half
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $CC,$CC,$33,$33,$CC,$CC,$33,$33  ; Tile 12: Blocks
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $AA,$55,$AA,$55,$AA,$55,$AA,$55  ; Tile 13: Fine checker
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $FF,$81,$81,$81,$81,$81,$81,$FF  ; Tile 14: Square outline
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $00,$3C,$42,$42,$42,$42,$3C,$00  ; Tile 15: Small circle
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $18,$18,$18,$FF,$FF,$18,$18,$18  ; Tile 16: Cross/plus
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tiles 17-24: More patterns
+.byte $01,$02,$04,$08,$10,$20,$40,$80  ; Tile 17: Diagonal single
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $80,$40,$20,$10,$08,$04,$02,$01  ; Tile 18: Other diagonal
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $00,$00,$00,$FF,$FF,$00,$00,$00  ; Tile 19: Horizontal line
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $18,$18,$18,$18,$18,$18,$18,$18  ; Tile 20: Vertical line
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $00,$00,$3C,$3C,$3C,$3C,$00,$00  ; Tile 21: Small square
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $E7,$E7,$00,$00,$00,$00,$E7,$E7  ; Tile 22: Corners
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $FF,$80,$80,$80,$80,$80,$80,$FF  ; Tile 23: L shapes
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $7E,$81,$A5,$81,$A5,$99,$81,$7E  ; Tile 24: Smiley
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tiles 25-31: Gradient densities
+.byte $11,$00,$44,$00,$11,$00,$44,$00  ; Tile 25: Very sparse
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $55,$00,$55,$00,$55,$00,$55,$00  ; Tile 26: Sparse
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $55,$22,$55,$88,$55,$22,$55,$88  ; Tile 27: Light
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $55,$AA,$55,$AA,$55,$AA,$55,$AA  ; Tile 28: Medium
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $77,$DD,$77,$DD,$77,$DD,$77,$DD  ; Tile 29: Dense
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $FF,$AA,$FF,$AA,$FF,$AA,$FF,$AA  ; Tile 30: Very dense
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF  ; Tile 31: Solid
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Fill rest with empty tiles
+.res 8192 - (32 * 16), $00
 

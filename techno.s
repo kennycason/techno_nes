@@ -182,76 +182,66 @@ update_music:
 @not_bar:
 @not_beat:
 
-    ; Check song section for different modes
+    ; MINIMAL TECHNO - clean sections, not too busy
     lda song_section
-    cmp #$01                ; Section 1 = acid mode
-    beq @acid_mode
-    cmp #$02                ; Section 2 = breakdown
+    cmp #$01                ; Section 1 = kick + bass + light arp
+    beq @groove_mode
+    cmp #$02                ; Section 2 = breakdown (bass only)
     beq @breakdown_mode
-    cmp #$03                ; Section 3 = DROP!
-    beq @drop_mode
-    cmp #$05                ; Section 5 = buildup/riser
+    cmp #$03                ; Section 3 = full groove
+    beq @full_mode
+    cmp #$04                ; Section 4 = acid (replace lead)
+    beq @acid_mode
+    cmp #$05                ; Section 5 = buildup
     beq @buildup_mode
-    cmp #$06                ; Section 6 = minimal
-    beq @minimal_mode
+    cmp #$06                ; Section 6 = drop (full but clean)
+    beq @drop_mode
     
-    ; Normal mode (sections 0, 4) - all elements
-    ; Check for fill beat
-    lda bar_count
-    and #$03
-    cmp #$03
-    bne @normal_kick
-    lda beat_count
-    and #$0F
-    cmp #$0E
-    bcc @normal_kick
-    jsr update_stutter
-    jmp @after_kick
-@normal_kick:
+    ; Section 0: Intro - just kick and bass
     jsr update_kick
-@after_kick:
-    jsr update_hihat  
     jsr update_bass
-    jsr update_lead
-    jsr update_arp
     rts
 
-@acid_mode:
-    ; Acid techno - 303-style bass!
+@groove_mode:
+    ; Kick + bass + soft arp (no hats yet)
     jsr update_kick
-    jsr update_hihat
-    jsr update_acid         ; Acid bass line!
-    jsr update_arp
+    jsr update_bass
+    jsr update_arp_soft     ; Quieter arp
     rts
     
 @breakdown_mode:
-    ; Breakdown - atmospheric
+    ; Breakdown - just bass and pad, very minimal
     jsr update_bass
     jsr update_pad
-    jsr update_hihat
     rts
 
-@drop_mode:
-    ; DROP! Maximum energy
-    jsr update_drop_kick    ; Heavy kicks
+@full_mode:
+    ; Full groove - kick, hat, bass, lead (but not arp - avoid clutter)
+    jsr update_kick
     jsr update_hihat
     jsr update_bass
     jsr update_lead
-    jsr update_arp
-    jsr update_acid         ; Layer acid too!
+    rts
+
+@acid_mode:
+    ; Acid mode - kick, bass, acid (no other melodies)
+    jsr update_kick
+    jsr update_hihat
+    jsr update_acid_clean   ; Cleaner acid
     rts
     
 @buildup_mode:
-    ; Buildup with riser
+    ; Buildup - kick gets faster, riser
     jsr update_kick
     jsr update_riser
-    jsr update_bass
     rts
 
-@minimal_mode:
-    ; Minimal - just kick and bass
+@drop_mode:
+    ; Drop - full but controlled
     jsr update_kick
+    jsr update_hihat
     jsr update_bass
+    jsr update_arp
     rts
 
 ;------------------------------------------------------------------------------
@@ -385,57 +375,40 @@ update_kick:
     rts
 
 ;------------------------------------------------------------------------------
-; Hi-hat - 16th note pattern (evolves with intensity)
+; Hi-hat - Clean, minimal pattern
 ;------------------------------------------------------------------------------
 update_hihat:
-    ; Different patterns based on intensity
-    lda intensity
-    cmp #$06
-    bcs @fast_hats          ; Fast 16ths at high intensity
-    cmp #$03
-    bcs @medium_hats        ; 8th notes at medium
-    
-    ; Slow hats - just offbeat
+    ; Simple offbeat hats - not too busy
     lda frame_count
     and #$1F
-    cmp #$08                ; Frame 8 only
-    beq @play_hat
-    rts
     
-@medium_hats:
-    ; 8th note hats
-    lda frame_count
-    and #$0F                ; Every 16 frames
-    cmp #$08
+    cmp #$10                ; Just offbeat (frame 16)
     beq @play_hat
-    rts
     
-@fast_hats:
-    ; 16th note hats (every 8 frames)
-    lda frame_count
-    and #$07
-    cmp #$04
-    beq @play_hat
+    ; Optional: add a quiet closed hat on beat
     cmp #$00
-    beq @play_accent_hat    ; Accent on downbeat
-    rts
+    bne @hat_done
     
-@play_accent_hat:
-    lda #%00111010          ; Vol 10 (accent)
+    ; Quiet closed hat on downbeat
+    lda #%00110100          ; Vol 4 (quiet)
     sta APU_NOISE_CTRL
-    lda #$0E                ; High pitch
+    lda #$0F                ; Highest pitch
     sta APU_NOISE_FREQ
-    lda #$08
+    lda #$02                ; Very short
     sta APU_NOISE_LEN
     rts
     
 @play_hat:
-    lda #%00110110          ; Vol 6
+    ; Open hat on offbeat
+    lda #%00110111          ; Vol 7
     sta APU_NOISE_CTRL
-    lda #$0F                ; Highest pitch
+    lda #$0E                ; High pitch
     sta APU_NOISE_FREQ
-    lda #$04
+    lda #$06
     sta APU_NOISE_LEN
+    rts
+    
+@hat_done:
     rts
 
 ;------------------------------------------------------------------------------
@@ -497,90 +470,50 @@ update_bass:
     rts
 
 ;------------------------------------------------------------------------------
-; Lead Synth - Pulse 1, chord stabs with filter sweep
+; Lead Synth - Clean chord stabs (less busy)
 ;------------------------------------------------------------------------------
 update_lead:
-    ; Only play after some intensity
-    lda intensity
-    cmp #$03
-    bcc @lead_off
-    
-    ; Different patterns based on bar
-    lda bar_count
-    and #$03
-    cmp #$03
-    beq @lead_fill          ; Every 4th bar = fill
-    
-    ; Normal: play on certain beats
+    ; Play sparse stabs - every 8 beats
     lda beat_count
-    and #$03
-    bne @lead_sustain
+    and #$07
+    bne @lead_sustain       ; Only play on beat 0 of every 8
     
     lda frame_count
     and #$1F
     cmp #$04                ; Stab on frame 4
     bne @lead_sustain
     
-    ; STAB! Get note from pattern
-    lda beat_count
-    lsr a
-    lsr a
-    clc
-    adc bar_count           ; Add variation over time
-    and #$07                ; 8 notes
+    ; STAB! Simple chord tone
+    lda bar_count
+    and #$03                ; 4 notes cycle
     tax
     lda lead_lo, x
     sta APU_PULSE1_LO
     lda lead_hi, x
     sta APU_PULSE1_HI
     
-    ; Duty cycle changes based on intensity (filter sweep effect)
-    lda intensity
-    and #$03
-    asl a
-    asl a
-    asl a
-    asl a
-    asl a
-    asl a                   ; Shift to bits 6-7
-    ora #%00111111          ; Vol 15
-    sta APU_PULSE1_CTRL
-    rts
-    
-@lead_fill:
-    ; Fill pattern - rapid notes
-    lda frame_count
-    and #$07                ; Every 8 frames
-    bne @lead_sustain
-    
-    lda frame_count
-    lsr a
-    lsr a
-    lsr a
-    and #$07
-    tax
-    lda lead_lo, x
-    sta APU_PULSE1_LO
-    lda lead_hi, x
-    sta APU_PULSE1_HI
-    lda #%01111110          ; 25% duty, vol 14
+    ; Clean, warm tone
+    lda #%10111010          ; 50% duty, vol 10
     sta APU_PULSE1_CTRL
     rts
     
 @lead_sustain:
-    ; Quick decay
+    ; Gentle decay
     lda frame_count
-    and #$07
-    cmp #$03
-    bcc @done
-    lda #%10110100          ; Vol 4
+    and #$1F
+    cmp #$08
+    bcc @lead_done
+    cmp #$10
+    bcs @lead_off
+    
+    lda #%10110110          ; Vol 6
     sta APU_PULSE1_CTRL
     rts
     
 @lead_off:
     lda #%10110000          ; Vol 0
     sta APU_PULSE1_CTRL
-@done:
+@lead_done:
     rts
 
 ;------------------------------------------------------------------------------
@@ -679,6 +612,82 @@ update_arp:
 @arp_off:
     lda #%01110000          ; Vol 0
     sta APU_PULSE2_CTRL
+    rts
+
+;------------------------------------------------------------------------------
+; Soft Arp - Quieter, more subtle (for minimal sections)
+;------------------------------------------------------------------------------
+update_arp_soft:
+    ; Slower arp - every 8 frames
+    lda frame_count
+    and #$07
+    bne @soft_sustain
+    
+    ; Get note
+    lda frame_count
+    lsr a
+    lsr a
+    lsr a
+    and #$07
+    tax
+    lda arp_lo, x
+    sta APU_PULSE2_LO
+    lda arp_hi, x
+    sta APU_PULSE2_HI
+    
+    ; Soft volume
+    lda #%01110101          ; 25% duty, vol 5
+    sta APU_PULSE2_CTRL
+    rts
+    
+@soft_sustain:
+    lda frame_count
+    and #$07
+    cmp #$04
+    bcc @soft_done
+    lda #%01110010          ; Vol 2
+    sta APU_PULSE2_CTRL
+@soft_done:
+    rts
+
+;------------------------------------------------------------------------------
+; Clean Acid - Less aggressive 303 sound
+;------------------------------------------------------------------------------
+update_acid_clean:
+    ; Slower, cleaner acid - every 16 frames
+    lda frame_count
+    and #$0F
+    bne @acid_clean_sustain
+    
+    ; Get note
+    lda frame_count
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    clc
+    adc beat_count
+    and #$07                ; 8-note pattern (simpler)
+    tax
+    lda acid_lo, x
+    sta APU_PULSE1_LO
+    lda acid_hi, x
+    sta APU_PULSE1_HI
+    
+    ; Clean tone
+    lda #%10111001          ; 50% duty, vol 9
+    sta APU_PULSE1_CTRL
+    rts
+    
+@acid_clean_sustain:
+    lda frame_count
+    and #$0F
+    cmp #$08
+    bcc @acid_clean_done
+    ; Gentle decay
+    lda #%10110100          ; Vol 4
+    sta APU_PULSE1_CTRL
+@acid_clean_done:
     rts
 
 ;------------------------------------------------------------------------------

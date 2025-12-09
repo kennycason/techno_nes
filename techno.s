@@ -60,6 +60,8 @@ vis_pulse:      .res 1      ; Beat pulse (spikes on kick)
 vis_hue:        .res 1      ; Color cycling
 vis_phase2:     .res 1      ; Secondary phase (different speed)
 vis_wave:       .res 1      ; Wave offset (screen ripple effect)
+vis_twist:      .res 1      ; Twist/spiral effect (NEW!)
+vis_flash:      .res 1      ; Flash brightness on drops (NEW!)
 vis_temp:       .res 4      ; Temp vars for calculations
 tile_x:         .res 1      ; Current tile X position
 tile_y:         .res 1      ; Current tile Y position
@@ -265,35 +267,45 @@ update_palette_cycle:
     lda #$01                ; Start at color 1
     sta PPU_ADDR
     
-    ; Color 1 - base hue, brightens on beat
+    ; Color 1 - base hue, brightens on beat + flash
     lda vis_hue
     and #$0C                ; Hue (0, 4, 8, C)
     clc
     adc vis_pulse           ; Brighter on beat!
-    and #$0F                ; Keep in range
-    cmp #$0D                ; Avoid grays
+    clc
+    adc vis_flash           ; FLASH on section change!
+    lsr a                   ; Scale down
+    and #$0F
+    cmp #$0D
     bcc @c1_ok
     lda #$0C
 @c1_ok:
-    ora #$10                ; Medium brightness
+    ora #$10
     sta PPU_DATA
     
-    ; Color 2 - offset hue, tracks intensity
+    ; Color 2 - offset hue + flash makes it pop
+    lda vis_flash
+    cmp #$08                ; Strong flash?
+    bcc @c2_normal
+    ; Flash white-ish!
+    lda #$30
+    jmp @c2_write
+@c2_normal:
     lda vis_hue
     clc
     adc #$04
-    clc
-    adc song_section        ; Changes with section!
+    adc song_section
     and #$0C
-    ora #$20                ; Brighter
+    ora #$20
+@c2_write:
     sta PPU_DATA
     
-    ; Color 3 - complementary, pulses
+    ; Color 3 - complementary
     lda vis_hue
     clc
     adc #$08
     and #$0C
-    ora #$30                ; Brightest
+    ora #$30
     sta PPU_DATA
     rts
 
@@ -337,7 +349,7 @@ update_tiles:
     ; Don't need to avoid attributes - they're at $23C0+, we'll rarely hit them
     sta PPU_ADDR
     
-    ; Morphing formula - simple and reliable
+    ; Morphing formula - stable with flash
     
     ; X component: position + phase + a
     lda frame_count
@@ -353,19 +365,23 @@ update_tiles:
     lda frame_count+1
     eor vis_temp
     clc
-    adc vis_phase2          ; Use secondary phase here
+    adc vis_phase2
     clc
     adc vis_b
     
-    ; Simple XOR + c
+    ; XOR + c + twist (twist affects pattern, not position)
     eor vis_temp+1
     clc
     adc vis_c
+    clc
+    adc vis_twist           ; Twist modifies the XOR result instead
     
-    ; Beat pulse
+    ; Beat pulse + flash
     clc
     adc vis_pulse
     adc vis_pulse
+    clc
+    adc vis_flash           ; Flash on section change
     
     ; Ensure valid tile (1-31) - this is critical!
     and #$1F
@@ -484,6 +500,26 @@ update_visual_params:
     beq @pulse_done
     dec vis_pulse
 @pulse_done:
+
+    ; === NEW: Twist effect - creates spiral motion ===
+    lda frame_count
+    and #$03                ; Every 4 frames
+    bne @skip_twist
+    ; Twist direction changes with section
+    lda song_section
+    and #$02
+    beq @twist_cw
+    dec vis_twist           ; Counter-clockwise
+    jmp @skip_twist
+@twist_cw:
+    inc vis_twist           ; Clockwise
+@skip_twist:
+
+    ; === NEW: Flash on section changes ===
+    lda vis_flash
+    beq @flash_done
+    dec vis_flash           ; Decay flash
+@flash_done:
     rts
 
 ;------------------------------------------------------------------------------
@@ -563,9 +599,10 @@ update_music:
     rts
     
 @buildup_mode:
-    ; Buildup - kick gets faster, riser
+    ; Buildup - kick gets faster, riser, tom fill!
     jsr update_kick
     jsr update_riser
+    jsr update_tom_fill     ; NEW: tom roll builds tension!
     rts
 
 @drop_mode:
@@ -595,6 +632,10 @@ update_song_section:
     
     ; Every 4 bars, advance section
     inc song_section
+    ; FLASH on section change!
+    lda #$0F
+    sta vis_flash
+    
     lda song_section
     cmp #$07                ; 7 sections, then loop
     bcc @section_ok
@@ -1234,6 +1275,33 @@ update_drop_kick:
     lda #$08
     sta APU_NOISE_LEN
 @done:
+    rts
+
+;------------------------------------------------------------------------------
+; Tom Fill - Descending tom roll for buildups (uses Triangle briefly)
+;------------------------------------------------------------------------------
+update_tom_fill:
+    ; Quick tom hits that descend in pitch - every 4 frames
+    lda frame_count
+    and #$03
+    bne @tom_done
+    
+    ; Calculate descending pitch based on beat position
+    lda beat_count
+    and #$0F                ; 0-15 in bar
+    asl a                   ; 0-30
+    clc
+    adc #$80                ; Start high ($80-$9E)
+    sta APU_TRI_LO
+    
+    lda #$00
+    sta APU_TRI_HI
+    
+    ; Quick trigger
+    lda #%11000000          ; Short linear counter
+    sta APU_TRI_CTRL
+    
+@tom_done:
     rts
 
 ;------------------------------------------------------------------------------

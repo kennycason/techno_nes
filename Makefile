@@ -23,7 +23,7 @@ OBJ = $(ASM_SRC:.s=.o)
 #------------------------------------------------------------------------------
 # Default target
 #------------------------------------------------------------------------------
-.PHONY: all clean run techno
+.PHONY: all clean run techno kaleidoscope
 
 all: $(ROM)
 
@@ -37,6 +37,17 @@ techno.o: techno.s
 
 techno.nes: techno.o $(CFG)
 	$(LD65) -C $(CFG) -o techno.nes techno.o
+
+#------------------------------------------------------------------------------
+# Kaleidoscope - radial symmetry visuals with techno music
+#------------------------------------------------------------------------------
+kaleidoscope: kaleidoscope.nes
+
+kaleidoscope.o: kaleidoscope.s
+	$(CA65) kaleidoscope.s -o kaleidoscope.o
+
+kaleidoscope.nes: kaleidoscope.o $(CFG)
+	$(LD65) -C $(CFG) -o kaleidoscope.nes kaleidoscope.o
 
 #------------------------------------------------------------------------------
 # Assemble

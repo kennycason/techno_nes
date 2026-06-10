@@ -23,9 +23,9 @@ OBJ = $(ASM_SRC:.s=.o)
 #------------------------------------------------------------------------------
 # Default target
 #------------------------------------------------------------------------------
-.PHONY: all clean run techno kaleidoscope
+.PHONY: all clean run techno kaleidoscope nesynth
 
-all: $(ROM)
+all: $(ROM) techno.nes kaleidoscope.nes nesynth.nes
 
 #------------------------------------------------------------------------------
 # Techno - music only version
@@ -50,6 +50,17 @@ kaleidoscope.nes: kaleidoscope.o $(CFG)
 	$(LD65) -C $(CFG) -o kaleidoscope.nes kaleidoscope.o
 
 #------------------------------------------------------------------------------
+# NES Synth - interactive sound synthesizer
+#------------------------------------------------------------------------------
+nesynth: nesynth.nes
+
+nesynth.o: nesynth.s
+	$(CA65) nesynth.s -o nesynth.o
+
+nesynth.nes: nesynth.o $(CFG)
+	$(LD65) -C $(CFG) -o nesynth.nes nesynth.o
+
+#------------------------------------------------------------------------------
 # Assemble
 #------------------------------------------------------------------------------
 %.o: %.s
@@ -71,7 +82,7 @@ run: $(ROM)
 # Clean
 #------------------------------------------------------------------------------
 clean:
-	rm -f $(OBJ) $(ROM)
+	rm -f *.o *.nes
 
 #------------------------------------------------------------------------------
 # Help
@@ -80,9 +91,12 @@ help:
 	@echo "NES Chaos - Visual noise generator"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all   - Build chaos.nes (default)"
-	@echo "  run   - Build and run in fceux"
-	@echo "  clean - Remove build artifacts"
+	@echo "  all          - Build chaos.nes (default)"
+	@echo "  techno       - Build techno.nes"
+	@echo "  kaleidoscope - Build kaleidoscope.nes"
+	@echo "  nesynth      - Build nesynth.nes (interactive synth)"
+	@echo "  run          - Build and run in fceux"
+	@echo "  clean        - Remove build artifacts"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  - ca65/ld65 from cc65 suite"

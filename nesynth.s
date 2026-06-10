@@ -106,6 +106,7 @@ TILE_U        = 67
 TILE_ARROW    = 68   ; > param indicator (color 1 white)
 TILE_Y        = 69   ; 'Y' letter (color 1 white)
 TILE_F        = 70   ; 'F' letter (color 1 white)
+TILE_Z        = 71   ; 'Z' letter (color 1 white)
 
 ;------------------------------------------------------------------------------
 ; Zero Page
@@ -207,9 +208,6 @@ RESET:
     sta channel_snd+1
     sta channel_snd+2
     sta channel_snd+3
-    sta channel_wav+2       ; triangle: n/a
-    sta channel_wav+3       ; noise: long loop
-
     lda #$05                ; E3 = middle range
     sta cur_pitch
 
@@ -219,12 +217,6 @@ RESET:
 
     lda #$07                ; SPD 8 (16 frames/step, ~56 BPM)
     sta speed
-
-    ; seq_mode and locked default to 0 (cleared with RAM)
-
-    lda #$02                ; 50% duty for pulse channels
-    sta channel_wav
-    sta channel_wav+1
 
     lda #$FF
     sta last_played
@@ -1168,14 +1160,22 @@ param_up:
     inc channel_snd, x
     lda channel_snd, x
     cpx #$02
-    beq @snd_max2
-    cmp #$04
+    beq @snd_max4
+    cpx #$03
+    beq @snd_max6
+    cmp #$08            ; pulse: 8 presets
     bcc @done
     lda #$00
     sta channel_snd, x
     rts
-@snd_max2:
-    cmp #$02
+@snd_max4:
+    cmp #$04            ; triangle: 4 presets
+    bcc @done
+    lda #$00
+    sta channel_snd, x
+    rts
+@snd_max6:
+    cmp #$06            ; noise: 6 drum types
     bcc @done
     lda #$00
     sta channel_snd, x
@@ -1184,18 +1184,18 @@ param_up:
 @wav:
     ldx cur_channel
     cpx #$02
-    beq @done
+    beq @done           ; triangle: no WAV
     inc channel_wav, x
     lda channel_wav, x
     cpx #$03
     beq @wav_max2
-    cmp #$04
+    cmp #$04            ; pulse: 4 envelope modes
     bcc @done
     lda #$00
     sta channel_wav, x
     rts
 @wav_max2:
-    cmp #$02
+    cmp #$02            ; noise: 2 modes (LNG/MTL)
     bcc @done
     lda #$00
     sta channel_wav, x
@@ -1212,7 +1212,7 @@ param_up:
     rts
 @noise_pitch:
     lda channel_snd+3
-    cmp #$03
+    cmp #$05            ; 6 drum types (0-5)
     bcs @done
     inc channel_snd+3
 @done:
@@ -1264,12 +1264,18 @@ param_down:
     lda channel_snd, x
     bne @snd_dec
     cpx #$02
-    beq @snd_wrap2
-    lda #$03
+    beq @snd_wrap_tri
+    cpx #$03
+    beq @snd_wrap_noise
+    lda #$07            ; pulse: wrap to 7
     sta channel_snd, x
     rts
-@snd_wrap2:
-    lda #$01
+@snd_wrap_tri:
+    lda #$03            ; triangle: wrap to 3
+    sta channel_snd, x
+    rts
+@snd_wrap_noise:
+    lda #$05            ; noise: wrap to 5
     sta channel_snd, x
     rts
 @snd_dec:
@@ -1279,16 +1285,16 @@ param_down:
 @wav:
     ldx cur_channel
     cpx #$02
-    beq @done
+    beq @done           ; triangle: no WAV
     lda channel_wav, x
     bne @wav_dec
     cpx #$03
     beq @wav_wrap2
-    lda #$03
+    lda #$03            ; pulse: wrap to 3
     sta channel_wav, x
     rts
 @wav_wrap2:
-    lda #$01
+    lda #$01            ; noise: wrap to 1
     sta channel_wav, x
     rts
 @wav_dec:
@@ -1554,9 +1560,12 @@ play_pulse1:
 @sustain:
 @hold:
     ldx channel_snd
-    lda snd_pulse_vol, x
+    lda snd_pulse_vol, x    ; DD11VVVV (duty + volume)
     ldx channel_wav
-    ora duty_table, x
+    beq @p1_set
+    and #$C0                ; keep duty from SND
+    ora wav_envelope, x     ; apply envelope mode
+@p1_set:
     sta APU_PULSE1_CTRL
     rts
 
@@ -1601,9 +1610,12 @@ play_pulse2:
 @sustain:
 @hold:
     ldx channel_snd+1
-    lda snd_pulse_vol, x
+    lda snd_pulse_vol, x    ; DD11VVVV (duty + volume)
     ldx channel_wav+1
-    ora duty_table, x
+    beq @p2_set
+    and #$C0                ; keep duty from SND
+    ora wav_envelope, x     ; apply envelope mode
+@p2_set:
     sta APU_PULSE2_CTRL
     rts
 
@@ -1743,33 +1755,45 @@ note_freq_hi:
     .byte $01,$01,$00,$00,$00  ; Oct 2
     .byte $00,$00,$00,$00,$00  ; Oct 3
 
-; Duty cycle lookup
-duty_table:
-    .byte $00,$40,$80,$C0      ; 12.5%, 25%, 50%, 75%
-
 ; Channel base offsets in seq_data
 channel_base:
     .byte $00,$40,$80,$C0
 
-; Pulse SND presets (halt + const + volume)
+; Pulse SND presets (duty + halt + const + volume in one byte)
+; Format: DDhcVVVV — DD=duty, h=halt, c=const, VVVV=volume
 snd_pulse_vol:
-    .byte $3C                  ; 0=Lead:  vol 12
-    .byte $3F                  ; 1=Stab:  vol 15
-    .byte $38                  ; 2=Bass:  vol 8
-    .byte $35                  ; 3=Pad:   vol 5
+    .byte $BF                  ; 0=LED: 50% duty, vol 15 (warm lead)
+    .byte $3F                  ; 1=STB: 12.5% duty, vol 15 (bright stab)
+    .byte $FC                  ; 2=BAS: 75% duty, vol 12 (fat bass)
+    .byte $75                  ; 3=PAD: 25% duty, vol 5 (soft pad)
+    .byte $38                  ; 4=BUZ: 12.5% duty, vol 8 (thin buzz)
+    .byte $B9                  ; 5=SQR: 50% duty, vol 9 (square med)
+    .byte $FF                  ; 6=FUL: 75% duty, vol 15 (full power)
+    .byte $7C                  ; 7=TNK: 25% duty, vol 12 (bright tonk)
 
-; Triangle SND presets
+; WAV envelope modes for pulse (applied when WAV != 0)
+; Format: 0h0cVVVV — ORed with duty from SND (kept via AND $C0)
+; h=1 (loop envelope), c=0 (envelope mode), VVVV=decay period
+wav_envelope:
+    .byte $30                  ; 0=SUS: unused (sustain path skips this)
+    .byte $21                  ; 1=PLK: fast pluck (period 1, ~0.5s cycle)
+    .byte $24                  ; 2=TRM: tremolo (period 4, ~1.3s cycle)
+    .byte $28                  ; 3=SLW: slow fade (period 8, ~2.4s cycle)
+
+; Triangle SND presets (linear counter value)
 snd_tri_ctrl:
-    .byte $FF                  ; 0=Normal: sustained
-    .byte $8A                  ; 1=Staccato: short
+    .byte $FF                  ; 0=NRM: full sustain
+    .byte $8A                  ; 1=STC: staccato
+    .byte $84                  ; 2=SHT: short
+    .byte $81                  ; 3=PLS: ultra-short pulse
 
-; Drum parameters
+; Drum parameters (6 types)
 drum_ctrl:
-    .byte $3F,$3C,$34,$37      ; kick/snare/hat-c/hat-o volume
+    .byte $3F,$3C,$34,$37,$3B,$3E  ; kick/snare/hat-c/hat-o/tom/rim volume
 drum_freq:
-    .byte $02,$06,$0F,$0E      ; kick/snare/hat-c/hat-o pitch
+    .byte $02,$06,$0F,$0E,$04,$0A  ; kick/snare/hat-c/hat-o/tom/rim pitch
 drum_len:
-    .byte $18,$10,$02,$06      ; kick/snare/hat-c/hat-o length
+    .byte $18,$10,$02,$06,$10,$08  ; kick/snare/hat-c/hat-o/tom/rim length
 
 ; Noise loop mode
 noise_loop:
@@ -1805,27 +1829,35 @@ pind_addr_lo: .byte $A1, $C1, $E1, $01, $21, $41, $61
 
 ; SND preset name tiles (3 tiles per preset)
 snd_name_pulse:
-    .byte TILE_L, TILE_E, TILE_D   ; 0=Lead
-    .byte TILE_S, TILE_T, TILE_B   ; 1=Stab
-    .byte TILE_B, TILE_A, TILE_S   ; 2=Bass
-    .byte TILE_P, TILE_A, TILE_D   ; 3=Pad
+    .byte TILE_L, TILE_E, TILE_D   ; 0=LED (warm lead)
+    .byte TILE_S, TILE_T, TILE_B   ; 1=STB (bright stab)
+    .byte TILE_B, TILE_A, TILE_S   ; 2=BAS (fat bass)
+    .byte TILE_P, TILE_A, TILE_D   ; 3=PAD (soft pad)
+    .byte TILE_B, TILE_U, TILE_Z   ; 4=BUZ (thin buzz)
+    .byte TILE_S, TILE_Q, TILE_R   ; 5=SQR (square med)
+    .byte TILE_F, TILE_U, TILE_L   ; 6=FUL (full power)
+    .byte TILE_T, TILE_N, TILE_K   ; 7=TNK (bright tonk)
 
 snd_name_tri:
-    .byte TILE_N, TILE_R, TILE_M   ; 0=Normal
-    .byte TILE_S, TILE_T, TILE_C   ; 1=Staccato
+    .byte TILE_N, TILE_R, TILE_M   ; 0=NRM (full sustain)
+    .byte TILE_S, TILE_T, TILE_C   ; 1=STC (staccato)
+    .byte TILE_S, TILE_H, TILE_T   ; 2=SHT (short)
+    .byte TILE_P, TILE_L, TILE_S   ; 3=PLS (pulse)
 
 snd_name_noise:
     .byte TILE_K, TILE_C, TILE_K   ; 0=Kick
     .byte TILE_S, TILE_N, TILE_R   ; 1=Snare
     .byte TILE_H, TILE_T, TILE_C   ; 2=Hat Closed
     .byte TILE_H, TILE_T, TILE_O   ; 3=Hat Open
+    .byte TILE_T, TILE_O, TILE_M   ; 4=Tom
+    .byte TILE_R, TILE_I, TILE_M   ; 5=Rimshot
 
 ; WAV type name tiles (3 tiles per value)
 wav_name_pulse:
-    .byte TILE_S, TILE_Q, TILE_1   ; 0=SQ1 (12.5% duty)
-    .byte TILE_S, TILE_Q, TILE_2   ; 1=SQ2 (25% duty)
-    .byte TILE_S, TILE_Q, TILE_3   ; 2=SQ3 (50% duty)
-    .byte TILE_S, TILE_Q, TILE_4   ; 3=SQ4 (75% duty)
+    .byte TILE_S, TILE_U, TILE_S   ; 0=SUS (sustain)
+    .byte TILE_P, TILE_L, TILE_K   ; 1=PLK (pluck)
+    .byte TILE_T, TILE_R, TILE_M   ; 2=TRM (tremolo)
+    .byte TILE_S, TILE_L, TILE_W   ; 3=SLW (slow fade)
 
 wav_name_tri:
     .byte TILE_T, TILE_R, TILE_I   ; 0=TRI
@@ -2075,5 +2107,9 @@ speed_ones_tile:
 .byte $7E,$60,$60,$7C,$60,$60,$60,$00
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
+; Tile 71: 'Z'
+.byte $7E,$06,$0C,$18,$30,$60,$7E,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
 ; Fill remaining CHR space
-.res 8192 - (71 * 16), $00
+.res 8192 - (72 * 16), $00

@@ -2,11 +2,12 @@
 ;
 ; Controls:
 ;   Select      = Cycle channel (C1-C4: Pulse1, Pulse2, Triangle, Noise)
-;   Left/Right  = Cycle parameter (SND, WAV, SEQ, SEG)
-;   Up/Down     = Change current parameter value
-;   A           = SEQ: record note at cursor (hold=sustain) / SND,WAV: preview
+;   Up/Down     = Cycle parameter (SND, WAV, NTE, SEQ, SEG, SPD, LCK)
+;   Left/Right  = Change current parameter value
+;   A           = Toggle note at cursor (hold=sustain)
 ;   B           = Clear current channel's segment
 ;   Start       = Play/pause sequencer
+;   LCK=YES     = Lock all editing (A/B/Select/L/R disabled except LCK)
 
 ;------------------------------------------------------------------------------
 ; Hardware Registers
@@ -57,10 +58,12 @@ MAX_PITCH   = 19
 
 PARAM_SND = 0
 PARAM_WAV = 1
-PARAM_SEQ = 2
-PARAM_SEG = 3
-PARAM_SPD = 4
-NUM_PARAMS = 5
+PARAM_NTE = 2
+PARAM_SEQ = 3
+PARAM_SEG = 4
+PARAM_SPD = 5
+PARAM_LCK = 6
+NUM_PARAMS = 7
 
 ; Tile indices
 TILE_EMPTY    = 0
@@ -101,6 +104,8 @@ TILE_R        = 65
 TILE_T        = 66
 TILE_U        = 67
 TILE_ARROW    = 68   ; > param indicator (color 1 white)
+TILE_Y        = 69   ; 'Y' letter (color 1 white)
+TILE_F        = 70   ; 'F' letter (color 1 white)
 
 ;------------------------------------------------------------------------------
 ; Zero Page
@@ -121,9 +126,10 @@ channel_snd:     .res 4      ; sound preset per channel
 channel_wav:     .res 4      ; waveform per channel
 last_played:     .res 4      ; last note index per channel ($FF=none)
 recording:       .res 1
-preview_ch:      .res 1      ; channel being previewed ($FF=none)
 display_dirty:   .res 1
-speed:           .res 1      ; 0-8 (index into speed_table, displays as 1-9)
+speed:           .res 1      ; 0-15 (index into speed_table, displays as 1-16)
+seq_mode:        .res 1      ; 0=SEG (loop current), 1=ALL (auto-advance)
+locked:          .res 1      ; 0=NO, 1=YES (lock editing)
 temp:            .res 1
 temp2:           .res 1
 
@@ -214,6 +220,8 @@ RESET:
     lda #$07                ; SPD 8 (16 frames/step, ~56 BPM)
     sta speed
 
+    ; seq_mode and locked default to 0 (cleared with RAM)
+
     lda #$02                ; 50% duty for pulse channels
     sta channel_wav
     sta channel_wav+1
@@ -223,7 +231,6 @@ RESET:
     sta last_played+1
     sta last_played+2
     sta last_played+3
-    sta preview_ch
 
     ; Enable APU channels
     lda #%00001111
@@ -462,7 +469,7 @@ init_nametable:
     dex
     bne @s4
 
-    ; --- Parameter labels (vertical column, rows 13-17) ---
+    ; --- Parameter labels (vertical column, rows 13-19) ---
     ; SND (row 13, col 2-4 = $21A2)
     lda #$21
     sta PPU_ADDR
@@ -487,19 +494,19 @@ init_nametable:
     lda #TILE_V
     sta PPU_DATA
 
-    ; SEQ (row 15, col 2-4 = $21E2)
+    ; NTE (row 15, col 2-4 = $21E2)
     lda #$21
     sta PPU_ADDR
     lda #$E2
     sta PPU_ADDR
-    lda #TILE_S
+    lda #TILE_N
+    sta PPU_DATA
+    lda #TILE_T
     sta PPU_DATA
     lda #TILE_E
     sta PPU_DATA
-    lda #TILE_Q
-    sta PPU_DATA
 
-    ; SEG (row 16, col 2-4 = $2202)
+    ; SEQ (row 16, col 2-4 = $2202)
     lda #$22
     sta PPU_ADDR
     lda #$02
@@ -508,19 +515,43 @@ init_nametable:
     sta PPU_DATA
     lda #TILE_E
     sta PPU_DATA
-    lda #TILE_G
+    lda #TILE_Q
     sta PPU_DATA
 
-    ; SPD (row 17, col 2-4 = $2222)
+    ; SEG (row 17, col 2-4 = $2222)
     lda #$22
     sta PPU_ADDR
     lda #$22
     sta PPU_ADDR
     lda #TILE_S
     sta PPU_DATA
+    lda #TILE_E
+    sta PPU_DATA
+    lda #TILE_G
+    sta PPU_DATA
+
+    ; SPD (row 18, col 2-4 = $2242)
+    lda #$22
+    sta PPU_ADDR
+    lda #$42
+    sta PPU_ADDR
+    lda #TILE_S
+    sta PPU_DATA
     lda #TILE_P
     sta PPU_DATA
     lda #TILE_D
+    sta PPU_DATA
+
+    ; LCK (row 19, col 2-4 = $2262)
+    lda #$22
+    sta PPU_ADDR
+    lda #$62
+    sta PPU_ADDR
+    lda #TILE_L
+    sta PPU_DATA
+    lda #TILE_C
+    sta PPU_DATA
+    lda #TILE_K
     sta PPU_DATA
 
     ; --- Attribute table ($23C0-$23FF) ---
@@ -723,17 +754,24 @@ update_param_values:
     sta PPU_ADDR
     jsr write_wav_value
 
-    ; SEQ value at row 15, col 6 ($21E6)
+    ; NTE value at row 15, col 6 ($21E6)
     lda #$21
     sta PPU_ADDR
     lda #$E6
     sta PPU_ADDR
-    jsr write_seq_value
+    jsr write_nte_value
 
-    ; SEG value at row 16, col 6 ($2206)
+    ; SEQ value at row 16, col 6 ($2206)
     lda #$22
     sta PPU_ADDR
     lda #$06
+    sta PPU_ADDR
+    jsr write_seq_mode_value
+
+    ; SEG value at row 17, col 6 ($2226)
+    lda #$22
+    sta PPU_ADDR
+    lda #$26
     sta PPU_ADDR
     lda global_seg
     clc
@@ -743,18 +781,34 @@ update_param_values:
     sta PPU_DATA
     sta PPU_DATA
 
-    ; SPD value at row 17, col 6 ($2226)
+    ; SPD value at row 18, col 6 ($2246)
     lda #$22
     sta PPU_ADDR
-    lda #$26
+    lda #$46
     sta PPU_ADDR
     ldx speed
-    lda speed_ones_tile, x
-    sta PPU_DATA
     lda speed_tens_tile, x
+    beq @spd_single
+    sta PPU_DATA
+    lda speed_ones_tile, x
     sta PPU_DATA
     lda #TILE_EMPTY
     sta PPU_DATA
+    jmp @spd_done
+@spd_single:
+    lda speed_ones_tile, x
+    sta PPU_DATA
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    sta PPU_DATA
+@spd_done:
+
+    ; LCK value at row 19, col 6 ($2266)
+    lda #$22
+    sta PPU_ADDR
+    lda #$66
+    sta PPU_ADDR
+    jsr write_lck_value
     rts
 
 ;------------------------------------------------------------------------------
@@ -849,24 +903,81 @@ write_wav_value:
     rts
 
 ;------------------------------------------------------------------------------
-; Write SEQ value (3 tiles: note+octave or drum name)
+; Write NTE value (3 tiles: note+octave or drum name)
 ;------------------------------------------------------------------------------
-write_seq_value:
-    lda cur_param
-    cmp #PARAM_SEQ
-    bne @blank
-    ; Show "EDT" when SEQ is selected
-    lda #TILE_E
+write_nte_value:
+    lda cur_channel
+    cmp #$03
+    beq @noise
+    ldx cur_pitch
+    lda pitch_to_note, x
+    tax
+    lda note_tiles, x
     sta PPU_DATA
-    lda #TILE_D
+    ldx cur_pitch
+    lda pitch_to_octave, x
+    clc
+    adc #TILE_1
     sta PPU_DATA
-    lda #TILE_T
-    sta PPU_DATA
-    rts
-@blank:
     lda #TILE_EMPTY
     sta PPU_DATA
+    rts
+@noise:
+    lda channel_snd+3
+    sta temp
+    asl a
+    clc
+    adc temp
+    tax
+    lda snd_name_noise, x
     sta PPU_DATA
+    lda snd_name_noise+1, x
+    sta PPU_DATA
+    lda snd_name_noise+2, x
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Write SEQ mode value (3 tiles: ALL or SEG)
+;------------------------------------------------------------------------------
+write_seq_mode_value:
+    lda seq_mode
+    bne @all
+    lda #TILE_S
+    sta PPU_DATA
+    lda #TILE_E
+    sta PPU_DATA
+    lda #TILE_G
+    sta PPU_DATA
+    rts
+@all:
+    lda #TILE_A
+    sta PPU_DATA
+    lda #TILE_L
+    sta PPU_DATA
+    lda #TILE_L
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Write LCK value (3 tiles: NO or YES)
+;------------------------------------------------------------------------------
+write_lck_value:
+    lda locked
+    bne @yes
+    lda #TILE_N
+    sta PPU_DATA
+    lda #TILE_O
+    sta PPU_DATA
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    rts
+@yes:
+    lda #TILE_Y
+    sta PPU_DATA
+    lda #TILE_E
+    sta PPU_DATA
+    lda #TILE_S
     sta PPU_DATA
     rts
 
@@ -899,19 +1010,7 @@ handle_input:
     and buttons_cur
     sta buttons_new
 
-    ; --- Select: cycle channel ---
-    lda buttons_new
-    and #BTN_SELECT
-    beq @no_sel
-    inc cur_channel
-    lda cur_channel
-    and #$03
-    sta cur_channel
-    lda #$01
-    sta display_dirty
-@no_sel:
-
-    ; --- Up: prev parameter ---
+    ; --- Up: prev parameter (always works) ---
     lda buttons_new
     and #BTN_UP
     beq @no_u
@@ -926,7 +1025,7 @@ handle_input:
     sta display_dirty
 @no_u:
 
-    ; --- Down: next parameter ---
+    ; --- Down: next parameter (always works) ---
     lda buttons_new
     and #BTN_DOWN
     beq @no_d
@@ -940,6 +1039,54 @@ handle_input:
     lda #$01
     sta display_dirty
 @no_d:
+
+    ; --- Start: play/pause (always works) ---
+    lda buttons_new
+    and #BTN_START
+    beq @no_st
+    lda seq_playing
+    eor #$01
+    sta seq_playing
+    lda #$01
+    sta display_dirty
+@no_st:
+
+    ; --- Lock check: if locked, only allow L/R on LCK param ---
+    lda locked
+    beq @unlocked
+
+    ; Locked: only Left/Right on PARAM_LCK
+    lda cur_param
+    cmp #PARAM_LCK
+    bne @done_locked
+    lda buttons_new
+    and #BTN_RIGHT
+    beq @lck_no_r
+    jsr param_up
+    lda #$01
+    sta display_dirty
+@lck_no_r:
+    lda buttons_new
+    and #BTN_LEFT
+    beq @done_locked
+    jsr param_down
+    lda #$01
+    sta display_dirty
+@done_locked:
+    rts
+
+@unlocked:
+    ; --- Select: cycle channel ---
+    lda buttons_new
+    and #BTN_SELECT
+    beq @no_sel
+    inc cur_channel
+    lda cur_channel
+    and #$03
+    sta cur_channel
+    lda #$01
+    sta display_dirty
+@no_sel:
 
     ; --- Right: increase value ---
     lda buttons_new
@@ -959,36 +1106,22 @@ handle_input:
     sta display_dirty
 @no_l:
 
-    ; --- A: record / preview ---
+    ; --- A: toggle note at cursor (always) ---
     jsr handle_a_button
 
-    ; --- B: clear current channel's segment (SEQ mode only) ---
+    ; --- B: clear current channel's segment ---
     lda buttons_new
     and #BTN_B
     beq @no_b
-    lda cur_param
-    cmp #PARAM_SEQ
-    bne @no_b
     jsr clear_channel_segment
     lda #$01
     sta display_dirty
 @no_b:
 
-    ; --- Start: play/pause ---
-    lda buttons_new
-    and #BTN_START
-    beq @no_st
-    lda seq_playing
-    eor #$01
-    sta seq_playing
-    lda #$01
-    sta display_dirty
-@no_st:
-
     rts
 
 ;------------------------------------------------------------------------------
-; Param Up
+; Param Up (Right button)
 ;------------------------------------------------------------------------------
 param_up:
     lda cur_param
@@ -996,11 +1129,27 @@ param_up:
     beq @snd
     cmp #PARAM_WAV
     beq @wav
-    cmp #PARAM_SEQ
+    cmp #PARAM_NTE
     beq @pitch
+    cmp #PARAM_SEQ
+    beq @seq
+    cmp #PARAM_SEG
+    beq @seg
     cmp #PARAM_SPD
     beq @spd
-    ; SEG
+    ; LCK
+    lda locked
+    eor #$01
+    sta locked
+    rts
+
+@seq:
+    lda seq_mode
+    eor #$01
+    sta seq_mode
+    rts
+
+@seg:
     lda global_seg
     cmp #$03
     bcs @done
@@ -1070,7 +1219,7 @@ param_up:
     rts
 
 ;------------------------------------------------------------------------------
-; Param Down
+; Param Down (Left button)
 ;------------------------------------------------------------------------------
 param_down:
     lda cur_param
@@ -1078,11 +1227,27 @@ param_down:
     beq @snd
     cmp #PARAM_WAV
     beq @wav
-    cmp #PARAM_SEQ
+    cmp #PARAM_NTE
     beq @pitch
+    cmp #PARAM_SEQ
+    beq @seq
+    cmp #PARAM_SEG
+    beq @seg
     cmp #PARAM_SPD
     beq @spd
-    ; SEG
+    ; LCK
+    lda locked
+    eor #$01
+    sta locked
+    rts
+
+@seq:
+    lda seq_mode
+    eor #$01
+    sta seq_mode
+    rts
+
+@seg:
     lda global_seg
     beq @done
     dec global_seg
@@ -1146,39 +1311,9 @@ param_down:
     rts
 
 ;------------------------------------------------------------------------------
-; Handle A button - preview in SND/WAV, record in SEQ
+; Handle A button - toggle note at cursor (always active)
 ;------------------------------------------------------------------------------
 handle_a_button:
-    lda cur_param
-    cmp #PARAM_SEQ
-    beq @seq_mode
-    cmp #PARAM_SEG
-    beq @done
-    cmp #PARAM_SPD
-    beq @done
-
-    ; SND or WAV: preview
-    lda buttons_cur
-    and #BTN_A
-    beq @prev_release
-
-    lda cur_channel
-    sta preview_ch
-    jsr preview_sound
-    rts
-
-@prev_release:
-    ldx preview_ch
-    cpx #$FF
-    beq @done
-    lda #$FF
-    sta last_played, x
-    jsr silence_channel_x
-    lda #$FF
-    sta preview_ch
-    rts
-
-@seq_mode:
     lda buttons_cur
     and #BTN_A
     beq @a_released
@@ -1216,93 +1351,6 @@ handle_a_button:
 @a_released:
     lda #$00
     sta recording
-    rts
-
-;------------------------------------------------------------------------------
-; Preview sound on current channel
-;------------------------------------------------------------------------------
-preview_sound:
-    ldx preview_ch
-    cpx #$00
-    beq @p1
-    cpx #$01
-    beq @p2
-    cpx #$02
-    beq @tri
-    jmp @noise
-
-@p1:
-    ldx cur_pitch
-    lda note_freq_lo, x
-    sta APU_PULSE1_LO
-    lda note_freq_hi, x
-    sta APU_PULSE1_HI
-    ldx channel_snd
-    lda snd_pulse_vol, x
-    ldx channel_wav
-    ora duty_table, x
-    sta APU_PULSE1_CTRL
-    rts
-
-@p2:
-    ldx cur_pitch
-    lda note_freq_lo, x
-    sta APU_PULSE2_LO
-    lda note_freq_hi, x
-    sta APU_PULSE2_HI
-    ldx channel_snd+1
-    lda snd_pulse_vol, x
-    ldx channel_wav+1
-    ora duty_table, x
-    sta APU_PULSE2_CTRL
-    rts
-
-@tri:
-    lda #$FF
-    sta APU_TRI_CTRL
-    ldx cur_pitch
-    lda note_freq_lo, x
-    sta APU_TRI_LO
-    lda note_freq_hi, x
-    sta APU_TRI_HI
-    rts
-
-@noise:
-    ldx channel_snd+3
-    lda drum_ctrl, x
-    sta APU_NOISE_CTRL
-    lda drum_freq, x
-    ldy channel_wav+3
-    ora noise_loop, y
-    sta APU_NOISE_FREQ
-    lda drum_len, x
-    sta APU_NOISE_LEN
-    rts
-
-;------------------------------------------------------------------------------
-; Silence channel X
-;------------------------------------------------------------------------------
-silence_channel_x:
-    cpx #$00
-    beq @p1
-    cpx #$01
-    beq @p2
-    cpx #$02
-    beq @tri
-    lda #$30
-    sta APU_NOISE_CTRL
-    rts
-@p1:
-    lda #$30
-    sta APU_PULSE1_CTRL
-    rts
-@p2:
-    lda #$30
-    sta APU_PULSE2_CTRL
-    rts
-@tri:
-    lda #$80
-    sta APU_TRI_CTRL
     rts
 
 ;------------------------------------------------------------------------------
@@ -1412,6 +1460,13 @@ update_sound:
     lda #$00
     sta seq_cursor
 
+    ; Cursor wrapped — check SEQ mode for auto-advance
+    lda seq_mode
+    beq @play               ; SEG mode: just loop
+    jsr advance_segment
+    lda #$01
+    sta display_dirty
+
 @play:
     jsr play_pulse1
     jsr play_pulse2
@@ -1421,13 +1476,56 @@ update_sound:
     rts
 
 ;------------------------------------------------------------------------------
+; Advance segment (SEQ=ALL mode)
+; Increments global_seg; if next segment is empty, wraps to 0
+;------------------------------------------------------------------------------
+advance_segment:
+    inc global_seg
+    lda global_seg
+    cmp #NUM_SEGS
+    bcc @check
+    lda #$00
+    sta global_seg
+    rts
+
+@check:
+    lda global_seg
+    asl a
+    asl a
+    asl a
+    asl a
+    sta temp                ; seg * 16
+
+    ldy #$00               ; channel index
+@chan:
+    lda channel_base, y
+    clc
+    adc temp
+    tax
+
+    lda #16
+    sta temp2
+@byte:
+    lda seq_data, x
+    bne @has_data
+    inx
+    dec temp2
+    bne @byte
+
+    iny
+    cpy #NUM_CHANNELS
+    bne @chan
+
+    ; All channels empty — wrap to segment 0
+    lda #$00
+    sta global_seg
+@has_data:
+    rts
+
+;------------------------------------------------------------------------------
 ; Play Pulse 1 (channel 0)
 ;------------------------------------------------------------------------------
 play_pulse1:
-    lda preview_ch
-    cmp #$00
-    beq @skip
-
     lda global_seg
     asl a
     asl a
@@ -1460,7 +1558,6 @@ play_pulse1:
     ldx channel_wav
     ora duty_table, x
     sta APU_PULSE1_CTRL
-@skip:
     rts
 
 @silence:
@@ -1474,10 +1571,6 @@ play_pulse1:
 ; Play Pulse 2 (channel 1)
 ;------------------------------------------------------------------------------
 play_pulse2:
-    lda preview_ch
-    cmp #$01
-    beq @skip
-
     lda global_seg
     asl a
     asl a
@@ -1512,7 +1605,6 @@ play_pulse2:
     ldx channel_wav+1
     ora duty_table, x
     sta APU_PULSE2_CTRL
-@skip:
     rts
 
 @silence:
@@ -1526,10 +1618,6 @@ play_pulse2:
 ; Play Triangle (channel 2)
 ;------------------------------------------------------------------------------
 play_triangle:
-    lda preview_ch
-    cmp #$02
-    beq @skip
-
     lda global_seg
     asl a
     asl a
@@ -1562,7 +1650,6 @@ play_triangle:
     ldx channel_snd+2
     lda snd_tri_ctrl, x
     sta APU_TRI_CTRL
-@skip:
     rts
 
 @silence:
@@ -1576,10 +1663,6 @@ play_triangle:
 ; Play Noise (channel 3)
 ;------------------------------------------------------------------------------
 play_noise:
-    lda preview_ch
-    cmp #$03
-    beq @skip
-
     lda global_seg
     asl a
     asl a
@@ -1609,7 +1692,6 @@ play_noise:
     sta APU_NOISE_FREQ
     lda drum_len, x
     sta APU_NOISE_LEN
-@skip:
     rts
 
 @hold:
@@ -1693,6 +1775,10 @@ drum_len:
 noise_loop:
     .byte $00,$80              ; 0=normal, 1=metallic
 
+; Note letter tiles (indexed by pitch_to_note value)
+note_tiles:
+    .byte TILE_E, TILE_G, TILE_A, TILE_B, TILE_D
+
 ; Pitch-to-note/octave lookup
 pitch_to_note:
     .byte 0,1,2,3,4            ; E G A B D
@@ -1713,10 +1799,9 @@ star_addr_lo: .byte $81, $C1, $01, $41
 grid_addr_hi: .byte $20, $20, $21, $21
 grid_addr_lo: .byte $85, $C5, $05, $45
 
-; PPU addresses for > param indicators
-; PPU addresses for > param indicators (rows 13-17, col 1)
-pind_addr_hi: .byte $21, $21, $21, $22, $22
-pind_addr_lo: .byte $A1, $C1, $E1, $01, $21
+; PPU addresses for > param indicators (rows 13-19, col 1)
+pind_addr_hi: .byte $21, $21, $21, $22, $22, $22, $22
+pind_addr_lo: .byte $A1, $C1, $E1, $01, $21, $41, $61
 
 ; SND preset name tiles (3 tiles per preset)
 snd_name_pulse:
@@ -1982,5 +2067,13 @@ speed_ones_tile:
 .byte $40,$60,$70,$78,$70,$60,$40,$00
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
+; Tile 69: 'Y'
+.byte $66,$66,$3C,$18,$18,$18,$18,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 70: 'F'
+.byte $7E,$60,$60,$7C,$60,$60,$60,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
 ; Fill remaining CHR space
-.res 8192 - (69 * 16), $00
+.res 8192 - (71 * 16), $00

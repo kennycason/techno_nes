@@ -5,11 +5,8 @@
 ;   Left/Right  = Cycle parameter (SND, WAV, SEQ, SEG)
 ;   Up/Down     = Change current parameter value
 ;   A           = SEQ: record note at cursor (hold=sustain) / SND,WAV: preview
-;   B           = SEQ: clear current channel's segment
+;   B           = Clear current channel's segment
 ;   Start       = Play/pause sequencer
-;
-; Channels:
-;   C1 = Pulse 1    C2 = Pulse 2    C3 = Triangle    C4 = Noise
 
 ;------------------------------------------------------------------------------
 ; Hardware Registers
@@ -58,11 +55,52 @@ NUM_SEGS    = 4
 NUM_CHANNELS = 4
 MAX_PITCH   = 19
 
-; Parameter indices
 PARAM_SND = 0
 PARAM_WAV = 1
 PARAM_SEQ = 2
 PARAM_SEG = 3
+PARAM_SPD = 4
+NUM_PARAMS = 5
+
+; Tile indices
+TILE_EMPTY    = 0
+TILE_E        = 32
+TILE_G        = 33
+TILE_A        = 34
+TILE_B        = 35
+TILE_D        = 36
+TILE_1        = 37
+TILE_2        = 38
+TILE_3        = 39
+TILE_4        = 40
+TILE_FILLED   = 41   ; solid color 2 (filled step)
+TILE_C        = 42
+TILE_S        = 43
+TILE_N        = 44
+TILE_W        = 45
+TILE_V        = 46
+TILE_Q        = 47
+TILE_0        = 48
+TILE_5        = 49
+TILE_6        = 50
+TILE_7        = 51
+TILE_8        = 52
+TILE_9        = 53
+TILE_STEP_E   = 54   ; empty step outline (color 2)
+TILE_CURSOR   = 55   ; cursor arrow (color 1 white)
+TILE_HOLD     = 56   ; hold/tie bar (color 2)
+TILE_STAR     = 57   ; selection indicator (color 2)
+TILE_H        = 58
+TILE_I        = 59
+TILE_K        = 60
+TILE_L        = 61
+TILE_M        = 62
+TILE_O        = 63
+TILE_P        = 64
+TILE_R        = 65
+TILE_T        = 66
+TILE_U        = 67
+TILE_ARROW    = 68   ; > param indicator (color 1 white)
 
 ;------------------------------------------------------------------------------
 ; Zero Page
@@ -78,14 +116,16 @@ cur_pitch:       .res 1      ; 0-19 (linear index into freq table)
 seq_cursor:      .res 1      ; 0-15
 seq_tick:        .res 1      ; 0-7
 seq_playing:     .res 1      ; 0=paused, 1=playing
-global_seg:      .res 1      ; 0-3 (current playback/edit segment)
+global_seg:      .res 1      ; 0-3 (current segment)
 channel_snd:     .res 4      ; sound preset per channel
 channel_wav:     .res 4      ; waveform per channel
 last_played:     .res 4      ; last note index per channel ($FF=none)
-recording:       .res 1      ; nonzero if A held in SEQ mode
+recording:       .res 1
 preview_ch:      .res 1      ; channel being previewed ($FF=none)
 display_dirty:   .res 1
+speed:           .res 1      ; 0-8 (index into speed_table, displays as 1-9)
 temp:            .res 1
+temp2:           .res 1
 
 ;------------------------------------------------------------------------------
 ; BSS - Sequence data in RAM
@@ -97,7 +137,7 @@ temp:            .res 1
 seq_data:        .res 256
 
 ;------------------------------------------------------------------------------
-; OAM (avoids linker warning)
+; OAM
 ;------------------------------------------------------------------------------
 .segment "OAM"
 
@@ -171,6 +211,9 @@ RESET:
     sta seq_playing
     sta display_dirty
 
+    lda #$07                ; SPD 8 (16 frames/step, ~56 BPM)
+    sta speed
+
     lda #$02                ; 50% duty for pulse channels
     sta channel_wav
     sta channel_wav+1
@@ -180,7 +223,7 @@ RESET:
     sta last_played+1
     sta last_played+2
     sta last_played+3
-    sta preview_ch          ; not previewing
+    sta preview_ch
 
     ; Enable APU channels
     lda #%00001111
@@ -222,16 +265,39 @@ NMI:
     bne @nw
     inc frame_count+1
 @nw:
-    ; === VBLANK ===
-    jsr update_palette
-
+    ; === VBLANK PPU WRITES (phased to fit in vblank) ===
     lda display_dirty
-    beq @skip_disp
-    jsr update_display
+    beq @cursor_only
+    cmp #$02
+    beq @phase2
+
+    ; Phase 1: stars + grids C1/C2 + cursor
+    bit PPU_STATUS
+    jsr update_star_indicators
+    lda #$00
+    sta temp2
+    jsr update_grids_pair
+    jsr update_cursor_row_inner
+    lda #$02
+    sta display_dirty
+    jmp @scroll_fixup
+
+@phase2:
+    ; Phase 2: grids C3/C4 + params + cursor
+    bit PPU_STATUS
+    lda #$02
+    sta temp2
+    jsr update_grids_pair
+    jsr update_param_indicators
+    jsr update_param_values
+    jsr update_cursor_row_inner
     lda #$00
     sta display_dirty
-@skip_disp:
+    jmp @scroll_fixup
 
+@cursor_only:
+    jsr update_cursor_row
+@scroll_fixup:
     lda #%10000000
     sta PPU_CTRL
     lda #$00
@@ -254,6 +320,9 @@ NMI:
 ; DISPLAY
 ;==============================================================================
 
+;------------------------------------------------------------------------------
+; Load palette - 4 fixed BG palettes (one per channel color)
+;------------------------------------------------------------------------------
 load_palette:
     bit PPU_STATUS
     lda #$3F
@@ -270,299 +339,551 @@ load_palette:
     rts
 
 ;------------------------------------------------------------------------------
-; Init nametable - clear + place step grid outlines
+; Init nametable - draw full static layout + attributes
+; Called during init (rendering off, no vblank constraint)
+;------------------------------------------------------------------------------
+; Layout:
+;   Row  4: *C1 [16 steps]
+;   Row  6:  C2 [16 steps]
+;   Row  8:  C3 [16 steps]
+;   Row 10:  C4 [16 steps]
+;   Row 11:      [cursor]
+;   Row 14: >SND val  WAV val
+;   Row 16:  SEQ val  SEG val
 ;------------------------------------------------------------------------------
 init_nametable:
     bit PPU_STATUS
+
+    ; Clear entire nametable + attribute table (1024 bytes)
     lda #$20
     sta PPU_ADDR
     lda #$00
     sta PPU_ADDR
-
     lda #$00
     ldx #$00
     ldy #$04
-@fill:
+@clear:
     sta PPU_DATA
     inx
-    bne @fill
+    bne @clear
     dey
-    bne @fill
+    bne @clear
 
-    ; Place 16 empty-step tiles on row 10, cols 8-23
-    bit PPU_STATUS
-    lda #$21
+    ; --- C1 label (row 4, cols 1-3) ---
+    lda #$20
     sta PPU_ADDR
-    lda #$48
+    lda #$81
     sta PPU_ADDR
-    lda #54                 ; empty step tile
-    ldx #$10
-@steps:
+    lda #TILE_STAR          ; C1 starts selected
+    sta PPU_DATA
+    lda #TILE_C
+    sta PPU_DATA
+    lda #TILE_1
+    sta PPU_DATA
+
+    ; C1 empty steps (row 4, cols 5-20)
+    lda #$20
+    sta PPU_ADDR
+    lda #$85
+    sta PPU_ADDR
+    lda #TILE_STEP_E
+    ldx #NUM_STEPS
+@s1:
     sta PPU_DATA
     dex
-    bne @steps
+    bne @s1
+
+    ; --- C2 label (row 6) ---
+    lda #$20
+    sta PPU_ADDR
+    lda #$C1
+    sta PPU_ADDR
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    lda #TILE_C
+    sta PPU_DATA
+    lda #TILE_2
+    sta PPU_DATA
+
+    lda #$20
+    sta PPU_ADDR
+    lda #$C5
+    sta PPU_ADDR
+    lda #TILE_STEP_E
+    ldx #NUM_STEPS
+@s2:
+    sta PPU_DATA
+    dex
+    bne @s2
+
+    ; --- C3 label (row 8) ---
+    lda #$21
+    sta PPU_ADDR
+    lda #$01
+    sta PPU_ADDR
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    lda #TILE_C
+    sta PPU_DATA
+    lda #TILE_3
+    sta PPU_DATA
+
+    lda #$21
+    sta PPU_ADDR
+    lda #$05
+    sta PPU_ADDR
+    lda #TILE_STEP_E
+    ldx #NUM_STEPS
+@s3:
+    sta PPU_DATA
+    dex
+    bne @s3
+
+    ; --- C4 label (row 10) ---
+    lda #$21
+    sta PPU_ADDR
+    lda #$41
+    sta PPU_ADDR
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    lda #TILE_C
+    sta PPU_DATA
+    lda #TILE_4
+    sta PPU_DATA
+
+    lda #$21
+    sta PPU_ADDR
+    lda #$45
+    sta PPU_ADDR
+    lda #TILE_STEP_E
+    ldx #NUM_STEPS
+@s4:
+    sta PPU_DATA
+    dex
+    bne @s4
+
+    ; --- Parameter labels (vertical column, rows 13-17) ---
+    ; SND (row 13, col 2-4 = $21A2)
+    lda #$21
+    sta PPU_ADDR
+    lda #$A2
+    sta PPU_ADDR
+    lda #TILE_S
+    sta PPU_DATA
+    lda #TILE_N
+    sta PPU_DATA
+    lda #TILE_D
+    sta PPU_DATA
+
+    ; WAV (row 14, col 2-4 = $21C2)
+    lda #$21
+    sta PPU_ADDR
+    lda #$C2
+    sta PPU_ADDR
+    lda #TILE_W
+    sta PPU_DATA
+    lda #TILE_A
+    sta PPU_DATA
+    lda #TILE_V
+    sta PPU_DATA
+
+    ; SEQ (row 15, col 2-4 = $21E2)
+    lda #$21
+    sta PPU_ADDR
+    lda #$E2
+    sta PPU_ADDR
+    lda #TILE_S
+    sta PPU_DATA
+    lda #TILE_E
+    sta PPU_DATA
+    lda #TILE_Q
+    sta PPU_DATA
+
+    ; SEG (row 16, col 2-4 = $2202)
+    lda #$22
+    sta PPU_ADDR
+    lda #$02
+    sta PPU_ADDR
+    lda #TILE_S
+    sta PPU_DATA
+    lda #TILE_E
+    sta PPU_DATA
+    lda #TILE_G
+    sta PPU_DATA
+
+    ; SPD (row 17, col 2-4 = $2222)
+    lda #$22
+    sta PPU_ADDR
+    lda #$22
+    sta PPU_ADDR
+    lda #TILE_S
+    sta PPU_DATA
+    lda #TILE_P
+    sta PPU_DATA
+    lda #TILE_D
+    sta PPU_DATA
+
+    ; --- Attribute table ($23C0-$23FF) ---
+    lda #$23
+    sta PPU_ADDR
+    lda #$C0
+    sta PPU_ADDR
+
+    ; Row 0 (tile rows 0-3): palette 0
+    lda #$00
+    ldx #$08
+@a0:
+    sta PPU_DATA
+    dex
+    bne @a0
+
+    ; Row 1 (tile rows 4-7): top=pal0(C1), bottom=pal1(C2)
+    lda #$50
+    ldx #$08
+@a1:
+    sta PPU_DATA
+    dex
+    bne @a1
+
+    ; Row 2 (tile rows 8-11): top=pal2(C3), bottom=pal3(C4)
+    lda #$FA
+    ldx #$08
+@a2:
+    sta PPU_DATA
+    dex
+    bne @a2
+
+    ; Rows 3-7 (tile rows 12-29): palette 0
+    lda #$00
+    ldx #40
+@a3:
+    sta PPU_DATA
+    dex
+    bne @a3
+
     rts
 
 ;------------------------------------------------------------------------------
-; Update palette - channel-colored
+; Update cursor row only (row 11, cols 5-20)
 ;------------------------------------------------------------------------------
-update_palette:
+update_cursor_row:
     bit PPU_STATUS
-    lda #$3F
-    sta PPU_ADDR
-    lda #$00
-    sta PPU_ADDR
-
-    lda #$0F
-    sta PPU_DATA            ; color 0: black bg
-
-    lda #$30
-    sta PPU_DATA            ; color 1: white text
-
-    ldx cur_channel
-    lda channel_color, x
-    sta PPU_DATA            ; color 2: channel highlight
-
-    lda channel_color_bright, x
-    sta PPU_DATA            ; color 3: bright accent
-    rts
-
-;------------------------------------------------------------------------------
-; Update display - all dynamic nametable content
-;------------------------------------------------------------------------------
-update_display:
-    bit PPU_STATUS
-
-    ; --- Row 2: Channel + Parameter label ---
-    lda #$20
-    sta PPU_ADDR
-    lda #$42                ; row 2, col 2
-    sta PPU_ADDR
-    lda #42                 ; 'C' tile
-    sta PPU_DATA
-    lda cur_channel
-    clc
-    adc #37                 ; digit 1-4
-    sta PPU_DATA
-
-    lda #$20
-    sta PPU_ADDR
-    lda #$45                ; row 2, col 5
-    sta PPU_ADDR
-    ldx cur_param
-    lda param_name_t0, x
-    sta PPU_DATA
-    lda param_name_t1, x
-    sta PPU_DATA
-    lda param_name_t2, x
-    sta PPU_DATA
-
-    ; --- Row 4: Parameter value ---
-    lda #$20
-    sta PPU_ADDR
-    lda #$82                ; row 4, col 2
-    sta PPU_ADDR
-    jsr write_param_value
-
-    ; --- Row 7: Current pitch ---
-    lda #$20
-    sta PPU_ADDR
-    lda #$E2                ; row 7, col 2
-    sta PPU_ADDR
-    jsr write_pitch_display
-
-    ; --- Row 10: Step grid (16 tiles, cols 8-23) ---
     lda #$21
     sta PPU_ADDR
-    lda #$48                ; row 10, col 8
+    lda #$65
     sta PPU_ADDR
-    jsr write_step_grid
-
-    ; --- Row 11: Cursor (16 tiles, cols 8-23) ---
-    lda #$21
-    sta PPU_ADDR
-    lda #$68                ; row 11, col 8
-    sta PPU_ADDR
-    jsr write_cursor_row
-
-    ; --- Row 14: Segment label + digit ---
-    lda #$21
-    sta PPU_ADDR
-    lda #$C2                ; row 14, col 2
-    sta PPU_ADDR
-    lda #43                 ; 'S'
-    sta PPU_DATA
-    lda #32                 ; 'E'
-    sta PPU_DATA
-    lda #33                 ; 'G'
-    sta PPU_DATA
-
-    lda #$21
-    sta PPU_ADDR
-    lda #$C6                ; row 14, col 6
-    sta PPU_ADDR
-    lda global_seg
-    clc
-    adc #37
-    sta PPU_DATA
-
-    rts
-
-;------------------------------------------------------------------------------
-; Write parameter value (3 tiles at current PPU address)
-;------------------------------------------------------------------------------
-write_param_value:
-    lda cur_param
-    cmp #PARAM_SND
-    beq @snd
-    cmp #PARAM_WAV
-    beq @wav
-    cmp #PARAM_SEQ
-    beq @seq
-    ; SEG
-    lda global_seg
-    clc
-    adc #37
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    sta PPU_DATA
-    rts
-
-@snd:
-    ldx cur_channel
-    lda channel_snd, x
-    clc
-    adc #37
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    sta PPU_DATA
-    rts
-
-@wav:
-    ldx cur_channel
-    lda channel_wav, x
-    clc
-    adc #37
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    sta PPU_DATA
-    rts
-
-@seq:
-    lda cur_channel
-    cmp #$03
-    beq @seq_noise
-    ; Pitched: note letter + octave
-    ldx cur_pitch
-    lda pitch_to_note, x
-    clc
-    adc #32
-    sta PPU_DATA
-    lda pitch_to_octave, x
-    clc
-    adc #37
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    rts
-@seq_noise:
-    lda channel_snd+3
-    clc
-    adc #37
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    sta PPU_DATA
-    rts
-
-;------------------------------------------------------------------------------
-; Write pitch display (3 tiles)
-;------------------------------------------------------------------------------
-write_pitch_display:
-    lda cur_channel
-    cmp #$03
-    beq @noise
-    ldx cur_pitch
-    lda pitch_to_note, x
-    clc
-    adc #32
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    lda pitch_to_octave, x
-    clc
-    adc #37
-    sta PPU_DATA
-    rts
-@noise:
-    lda channel_snd+3
-    clc
-    adc #37
-    sta PPU_DATA
-    lda #$00
-    sta PPU_DATA
-    sta PPU_DATA
-    rts
-
-;------------------------------------------------------------------------------
-; Write step grid (16 tiles from sequence data)
-;------------------------------------------------------------------------------
-write_step_grid:
-    ; Compute RAM offset for current channel + global segment
-    ldx cur_channel
-    lda channel_base, x
-    sta temp
-    lda global_seg
-    asl a
-    asl a
-    asl a
-    asl a
-    clc
-    adc temp
-    tax                     ; X = base offset into seq_data
-
-    ldy #NUM_STEPS
-@grid:
-    lda seq_data, x
-    beq @empty
-    cmp #$FF
-    beq @hold
-    lda #41                 ; filled note (color 2)
-    jmp @write
-@empty:
-    lda #54                 ; empty step outline
-    jmp @write
-@hold:
-    lda #56                 ; hold/tie marker
-@write:
-    sta PPU_DATA
-    inx
-    dey
-    bne @grid
-    rts
-
-;------------------------------------------------------------------------------
-; Write cursor row (16 tiles)
-;------------------------------------------------------------------------------
-write_cursor_row:
     ldx #$00
 @loop:
-    lda seq_playing
-    beq @blank              ; paused: hide cursor
     cpx seq_cursor
     bne @blank
-    lda #55                 ; cursor marker
+    lda #TILE_CURSOR
     jmp @wr
 @blank:
-    lda #$00
+    lda #TILE_EMPTY
 @wr:
     sta PPU_DATA
     inx
     cpx #NUM_STEPS
     bne @loop
+    rts
+
+;------------------------------------------------------------------------------
+; Update * indicators for all 4 channels
+;------------------------------------------------------------------------------
+update_star_indicators:
+    ldx #$00
+@loop:
+    lda star_addr_hi, x
+    sta PPU_ADDR
+    lda star_addr_lo, x
+    sta PPU_ADDR
+    cpx cur_channel
+    bne @no_star
+    lda #TILE_STAR
+    jmp @wr
+@no_star:
+    lda #TILE_EMPTY
+@wr:
+    sta PPU_DATA
+    inx
+    cpx #NUM_CHANNELS
+    bne @loop
+    rts
+
+;------------------------------------------------------------------------------
+; Update 2 channel grids starting from channel in temp2
+;------------------------------------------------------------------------------
+update_grids_pair:
+    lda global_seg
+    asl a
+    asl a
+    asl a
+    asl a
+    pha                     ; save seg*16 on stack
+@chan_loop:
+    ldx temp2
+    lda grid_addr_hi, x
+    sta PPU_ADDR
+    lda grid_addr_lo, x
+    sta PPU_ADDR
+
+    pla
+    pha                     ; peek seg*16
+    clc
+    adc channel_base, x
+    tax                     ; X = data offset
+
+    ldy #NUM_STEPS
+@tile:
+    lda seq_data, x
+    beq @empty
+    cmp #$FF
+    beq @hold
+    lda #TILE_FILLED
+    jmp @wr
+@empty:
+    lda #TILE_STEP_E
+    jmp @wr
+@hold:
+    lda #TILE_HOLD
+@wr:
+    sta PPU_DATA
+    inx
+    dey
+    bne @tile
+
+    inc temp2
+    lda temp2
+    and #$01                ; done after 2 channels (0→1→2 or 2→3→4)
+    bne @chan_loop
+    pla                     ; clean stack
+    rts
+
+;------------------------------------------------------------------------------
+; Update cursor row (no PPU_STATUS reset - called from update_display)
+;------------------------------------------------------------------------------
+update_cursor_row_inner:
+    lda #$21
+    sta PPU_ADDR
+    lda #$65
+    sta PPU_ADDR
+    ldx #$00
+@loop:
+    cpx seq_cursor
+    bne @blank
+    lda #TILE_CURSOR
+    jmp @wr
+@blank:
+    lda #TILE_EMPTY
+@wr:
+    sta PPU_DATA
+    inx
+    cpx #NUM_STEPS
+    bne @loop
+    rts
+
+;------------------------------------------------------------------------------
+; Update > param indicators
+;------------------------------------------------------------------------------
+update_param_indicators:
+    ldx #$00
+@loop:
+    lda pind_addr_hi, x
+    sta PPU_ADDR
+    lda pind_addr_lo, x
+    sta PPU_ADDR
+    cpx cur_param
+    bne @no_ind
+    lda #TILE_ARROW
+    jmp @wr
+@no_ind:
+    lda #TILE_EMPTY
+@wr:
+    sta PPU_DATA
+    inx
+    cpx #NUM_PARAMS
+    bne @loop
+    rts
+
+;------------------------------------------------------------------------------
+; Update parameter values
+;------------------------------------------------------------------------------
+update_param_values:
+    ; SND value at row 13, col 6 ($21A6)
+    lda #$21
+    sta PPU_ADDR
+    lda #$A6
+    sta PPU_ADDR
+    jsr write_snd_value
+
+    ; WAV value at row 14, col 6 ($21C6)
+    lda #$21
+    sta PPU_ADDR
+    lda #$C6
+    sta PPU_ADDR
+    jsr write_wav_value
+
+    ; SEQ value at row 15, col 6 ($21E6)
+    lda #$21
+    sta PPU_ADDR
+    lda #$E6
+    sta PPU_ADDR
+    jsr write_seq_value
+
+    ; SEG value at row 16, col 6 ($2206)
+    lda #$22
+    sta PPU_ADDR
+    lda #$06
+    sta PPU_ADDR
+    lda global_seg
+    clc
+    adc #TILE_1
+    sta PPU_DATA
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    sta PPU_DATA
+
+    ; SPD value at row 17, col 6 ($2226)
+    lda #$22
+    sta PPU_ADDR
+    lda #$26
+    sta PPU_ADDR
+    ldx speed
+    lda speed_tens_tile, x
+    sta PPU_DATA
+    lda speed_ones_tile, x
+    sta PPU_DATA
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Write SND preset name (3 tiles)
+;------------------------------------------------------------------------------
+write_snd_value:
+    ldx cur_channel
+    lda channel_snd, x
+    ; A = preset index, multiply by 3
+    sta temp
+    asl a
+    clc
+    adc temp
+    tax                     ; X = name table offset
+
+    lda cur_channel
+    cmp #$02
+    beq @tri
+    cmp #$03
+    beq @noise
+
+    ; Pulse channel
+    lda snd_name_pulse, x
+    sta PPU_DATA
+    lda snd_name_pulse+1, x
+    sta PPU_DATA
+    lda snd_name_pulse+2, x
+    sta PPU_DATA
+    rts
+
+@tri:
+    lda snd_name_tri, x
+    sta PPU_DATA
+    lda snd_name_tri+1, x
+    sta PPU_DATA
+    lda snd_name_tri+2, x
+    sta PPU_DATA
+    rts
+
+@noise:
+    lda snd_name_noise, x
+    sta PPU_DATA
+    lda snd_name_noise+1, x
+    sta PPU_DATA
+    lda snd_name_noise+2, x
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Write WAV type name (3 tiles)
+;------------------------------------------------------------------------------
+write_wav_value:
+    ldx cur_channel
+    lda channel_wav, x
+    sta temp
+    asl a
+    clc
+    adc temp
+    tax
+
+    lda cur_channel
+    cmp #$02
+    beq @tri
+    cmp #$03
+    beq @noise
+
+    ; Pulse
+    lda wav_name_pulse, x
+    sta PPU_DATA
+    lda wav_name_pulse+1, x
+    sta PPU_DATA
+    lda wav_name_pulse+2, x
+    sta PPU_DATA
+    rts
+
+@tri:
+    lda wav_name_tri, x
+    sta PPU_DATA
+    lda wav_name_tri+1, x
+    sta PPU_DATA
+    lda wav_name_tri+2, x
+    sta PPU_DATA
+    rts
+
+@noise:
+    lda wav_name_noise, x
+    sta PPU_DATA
+    lda wav_name_noise+1, x
+    sta PPU_DATA
+    lda wav_name_noise+2, x
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Write SEQ value (3 tiles: note+octave or drum name)
+;------------------------------------------------------------------------------
+write_seq_value:
+    lda cur_channel
+    cmp #$03
+    beq @noise
+
+    ; Pitched: note letter + octave
+    ldx cur_pitch
+    lda pitch_to_note, x
+    clc
+    adc #TILE_E             ; note letter tile
+    sta PPU_DATA
+    lda pitch_to_octave, x
+    clc
+    adc #TILE_1             ; octave digit tile
+    sta PPU_DATA
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    rts
+
+@noise:
+    ; Show drum type name
+    lda channel_snd+3
+    sta temp
+    asl a
+    clc
+    adc temp
+    tax
+    lda snd_name_noise, x
+    sta PPU_DATA
+    lda snd_name_noise+1, x
+    sta PPU_DATA
+    lda snd_name_noise+2, x
+    sta PPU_DATA
     rts
 
 ;==============================================================================
@@ -606,61 +927,61 @@ handle_input:
     sta display_dirty
 @no_sel:
 
-    ; --- Right: next parameter ---
+    ; --- Up: prev parameter ---
     lda buttons_new
-    and #BTN_RIGHT
-    beq @no_r
-    inc cur_param
+    and #BTN_UP
+    beq @no_u
     lda cur_param
-    and #$03
-    sta cur_param
-    lda #$01
-    sta display_dirty
-@no_r:
-
-    ; --- Left: prev parameter ---
-    lda buttons_new
-    and #BTN_LEFT
-    beq @no_l
-    lda cur_param
-    bne @l_dec
-    lda #$04
-@l_dec:
+    bne @u_dec
+    lda #NUM_PARAMS
+@u_dec:
     sec
     sbc #$01
     sta cur_param
     lda #$01
     sta display_dirty
-@no_l:
-
-    ; --- Up: increase value ---
-    lda buttons_new
-    and #BTN_UP
-    beq @no_u
-    jsr param_up
-    lda #$01
-    sta display_dirty
 @no_u:
 
-    ; --- Down: decrease value ---
+    ; --- Down: next parameter ---
     lda buttons_new
     and #BTN_DOWN
     beq @no_d
-    jsr param_down
+    inc cur_param
+    lda cur_param
+    cmp #NUM_PARAMS
+    bcc @d_ok
+    lda #$00
+    sta cur_param
+@d_ok:
     lda #$01
     sta display_dirty
 @no_d:
 
+    ; --- Right: increase value ---
+    lda buttons_new
+    and #BTN_RIGHT
+    beq @no_r
+    jsr param_up
+    lda #$01
+    sta display_dirty
+@no_r:
+
+    ; --- Left: decrease value ---
+    lda buttons_new
+    and #BTN_LEFT
+    beq @no_l
+    jsr param_down
+    lda #$01
+    sta display_dirty
+@no_l:
+
     ; --- A: record / preview ---
     jsr handle_a_button
 
-    ; --- B: clear segment (SEQ only) ---
+    ; --- B: clear current channel's segment ---
     lda buttons_new
     and #BTN_B
     beq @no_b
-    lda cur_param
-    cmp #PARAM_SEQ
-    bne @no_b
     jsr clear_channel_segment
     lda #$01
     sta display_dirty
@@ -690,6 +1011,8 @@ param_up:
     beq @wav
     cmp #PARAM_SEQ
     beq @pitch
+    cmp #PARAM_SPD
+    beq @spd
     ; SEG
     lda global_seg
     cmp #$03
@@ -697,13 +1020,20 @@ param_up:
     inc global_seg
     rts
 
+@spd:
+    lda speed
+    cmp #$0F
+    bcs @done
+    inc speed
+    rts
+
 @snd:
     ldx cur_channel
     inc channel_snd, x
     lda channel_snd, x
-    cpx #$02                ; triangle max = 2
+    cpx #$02
     beq @snd_max2
-    cmp #$04                ; pulse/noise max = 4
+    cmp #$04
     bcc @done
     lda #$00
     sta channel_snd, x
@@ -717,13 +1047,13 @@ param_up:
 
 @wav:
     ldx cur_channel
-    cpx #$02                ; triangle: no WAV
+    cpx #$02
     beq @done
     inc channel_wav, x
     lda channel_wav, x
-    cpx #$03                ; noise max = 2
+    cpx #$03
     beq @wav_max2
-    cmp #$04                ; pulse max = 4
+    cmp #$04
     bcc @done
     lda #$00
     sta channel_wav, x
@@ -736,10 +1066,19 @@ param_up:
     rts
 
 @pitch:
+    lda cur_channel
+    cmp #$03
+    beq @noise_pitch
     lda cur_pitch
     cmp #MAX_PITCH
     bcs @done
     inc cur_pitch
+    rts
+@noise_pitch:
+    lda channel_snd+3
+    cmp #$03
+    bcs @done
+    inc channel_snd+3
 @done:
     rts
 
@@ -754,10 +1093,18 @@ param_down:
     beq @wav
     cmp #PARAM_SEQ
     beq @pitch
+    cmp #PARAM_SPD
+    beq @spd
     ; SEG
     lda global_seg
     beq @done
     dec global_seg
+    rts
+
+@spd:
+    lda speed
+    beq @done
+    dec speed
     rts
 
 @snd:
@@ -779,7 +1126,7 @@ param_down:
 
 @wav:
     ldx cur_channel
-    cpx #$02                ; triangle: skip
+    cpx #$02
     beq @done
     lda channel_wav, x
     bne @wav_dec
@@ -797,9 +1144,17 @@ param_down:
     rts
 
 @pitch:
+    lda cur_channel
+    cmp #$03
+    beq @noise_pitch
     lda cur_pitch
     beq @done
     dec cur_pitch
+    rts
+@noise_pitch:
+    lda channel_snd+3
+    beq @done
+    dec channel_snd+3
 @done:
     rts
 
@@ -811,14 +1166,15 @@ handle_a_button:
     cmp #PARAM_SEQ
     beq @seq_mode
     cmp #PARAM_SEG
-    beq @done               ; no action in SEG mode
+    beq @done
+    cmp #PARAM_SPD
+    beq @done
 
     ; SND or WAV: preview
     lda buttons_cur
     and #BTN_A
     beq @prev_release
 
-    ; A held: preview sound
     lda cur_channel
     sta preview_ch
     jsr preview_sound
@@ -843,7 +1199,6 @@ handle_a_button:
     lda recording
     bne @already_rec
 
-    ; First frame of A press: record note
     lda #$01
     sta recording
     jsr write_note_at_cursor
@@ -852,7 +1207,6 @@ handle_a_button:
     rts
 
 @already_rec:
-    ; On tick boundary while held: write hold marker
     lda seq_tick
     bne @done
     jsr write_hold_at_cursor
@@ -957,19 +1311,19 @@ silence_channel_x:
 ; Write note at cursor position
 ;------------------------------------------------------------------------------
 write_note_at_cursor:
-    jsr calc_seq_offset     ; X = offset
+    jsr calc_seq_offset
     lda cur_channel
     cmp #$03
     beq @drum
     lda cur_pitch
     clc
-    adc #$01                ; $01-$14
+    adc #$01
     sta seq_data, x
     rts
 @drum:
     lda channel_snd+3
     clc
-    adc #$01                ; $01-$04
+    adc #$01
     sta seq_data, x
     rts
 
@@ -986,7 +1340,7 @@ write_hold_at_cursor:
 ; Clear current channel's current segment
 ;------------------------------------------------------------------------------
 clear_channel_segment:
-    jsr calc_seg_base       ; X = base offset for channel+segment
+    jsr calc_seg_base
     lda #$00
     ldy #NUM_STEPS
 @loop:
@@ -997,7 +1351,7 @@ clear_channel_segment:
     rts
 
 ;------------------------------------------------------------------------------
-; Calculate seq_data offset: channel_base + seg*16 + cursor → X
+; Calculate seq_data offset: channel_base + seg*16 + cursor -> X
 ;------------------------------------------------------------------------------
 calc_seq_offset:
     ldx cur_channel
@@ -1016,7 +1370,7 @@ calc_seq_offset:
     rts
 
 ;------------------------------------------------------------------------------
-; Calculate segment base offset: channel_base + seg*16 → X
+; Calculate segment base offset: channel_base + seg*16 -> X
 ;------------------------------------------------------------------------------
 calc_seg_base:
     ldx cur_channel
@@ -1044,9 +1398,10 @@ update_sound:
     beq @done
 
     inc seq_tick
+    ldx speed
     lda seq_tick
-    cmp #STEP_FRAMES
-    bcc @done               ; not a new step yet
+    cmp speed_table, x
+    bcc @done
 
     ; --- New step ---
     lda #$00
@@ -1058,125 +1413,23 @@ update_sound:
     bcc @play
     lda #$00
     sta seq_cursor
-    jsr advance_segment
 
 @play:
     jsr play_pulse1
     jsr play_pulse2
     jsr play_triangle
     jsr play_noise
-
-    lda #$01
-    sta display_dirty
 @done:
-    rts
-
-;------------------------------------------------------------------------------
-; Advance segment (on cursor wrap)
-;------------------------------------------------------------------------------
-advance_segment:
-    inc global_seg
-    lda global_seg
-    cmp #NUM_SEGS
-    bcc @check
-    lda #$00
-    sta global_seg
-    rts
-
-@check:
-    jsr check_segment_empty
-    beq @empty
-    rts
-@empty:
-    lda #$00
-    sta global_seg
-    rts
-
-;------------------------------------------------------------------------------
-; Check if current global_seg is empty across all channels
-; Returns Z=1 if empty, Z=0 if has data
-;------------------------------------------------------------------------------
-check_segment_empty:
-    lda global_seg
-    asl a
-    asl a
-    asl a
-    asl a
-    sta temp                ; seg * 16
-
-    lda #$00
-    sta recording           ; reuse as channel counter temporarily
-    ; (recording is safe to clobber here — we're between steps)
-    ; Actually, let me NOT clobber recording. Use a different approach.
-    ; Just inline the 4 channel checks.
-
-    ; Channel 0
-    lda temp
-    tax
-    ldy #NUM_STEPS
-@ch0:
-    lda seq_data, x
-    bne @not_empty
-    inx
-    dey
-    bne @ch0
-
-    ; Channel 1
-    lda temp
-    clc
-    adc #$40
-    tax
-    ldy #NUM_STEPS
-@ch1:
-    lda seq_data, x
-    bne @not_empty
-    inx
-    dey
-    bne @ch1
-
-    ; Channel 2
-    lda temp
-    clc
-    adc #$80
-    tax
-    ldy #NUM_STEPS
-@ch2:
-    lda seq_data, x
-    bne @not_empty
-    inx
-    dey
-    bne @ch2
-
-    ; Channel 3
-    lda temp
-    clc
-    adc #$C0
-    tax
-    ldy #NUM_STEPS
-@ch3:
-    lda seq_data, x
-    bne @not_empty
-    inx
-    dey
-    bne @ch3
-
-    lda #$00                ; all empty (Z=1)
-    rts
-
-@not_empty:
-    lda #$01                ; has data (Z=0)
     rts
 
 ;------------------------------------------------------------------------------
 ; Play Pulse 1 (channel 0)
 ;------------------------------------------------------------------------------
 play_pulse1:
-    ; Skip if previewing this channel
     lda preview_ch
     cmp #$00
     beq @skip
 
-    ; Read sequence byte
     lda global_seg
     asl a
     asl a
@@ -1191,7 +1444,6 @@ play_pulse1:
     cmp #$FF
     beq @hold
 
-    ; Note trigger
     sec
     sbc #$01
     tax
@@ -1346,11 +1598,10 @@ play_noise:
     cmp #$FF
     beq @hold
 
-    ; Drum trigger: value 1-4
     sec
     sbc #$01
     tax
-    stx last_played+3      ; always retrigger drums
+    stx last_played+3
 
     lda drum_ctrl, x
     sta APU_NOISE_CTRL
@@ -1364,7 +1615,7 @@ play_noise:
     rts
 
 @hold:
-    lda #$34                ; quiet sustain for drums
+    lda #$34
     sta APU_NOISE_CTRL
     rts
 
@@ -1386,15 +1637,18 @@ IRQ:
 ;==============================================================================
 .segment "RODATA"
 
+; 4 BG palettes - one per channel color
+; Each: bg, white text, channel color, bright accent
 initial_palette:
+    .byte $0F, $30, $16, $26   ; Pal 0: C1 red
+    .byte $0F, $30, $12, $22   ; Pal 1: C2 blue
+    .byte $0F, $30, $1A, $2A   ; Pal 2: C3 green
+    .byte $0F, $30, $28, $38   ; Pal 3: C4 yellow
+    ; Sprite palettes (unused, fill)
     .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
-    .byte $0F, $30, $16, $26
+    .byte $0F, $30, $12, $22
+    .byte $0F, $30, $1A, $2A
+    .byte $0F, $30, $28, $38
 
 ; Note frequencies - E minor pentatonic, 4 octaves (20 notes)
 note_freq_lo:
@@ -1441,31 +1695,80 @@ drum_len:
 noise_loop:
     .byte $00,$80              ; 0=normal, 1=metallic
 
-; Channel colors for palette
-channel_color:
-    .byte $16,$12,$1A,$18      ; red, blue, green, yellow
-channel_color_bright:
-    .byte $26,$22,$2A,$28
-
-; Parameter name tiles (3 tiles each)
-param_name_t0:
-    .byte 43,45,43,43          ; S,W,S,S
-param_name_t1:
-    .byte 44,34,32,32          ; N,A,E,E
-param_name_t2:
-    .byte 36,46,47,33          ; D,V,Q,G
-
-; Pitch-to-note/octave lookup (for display)
+; Pitch-to-note/octave lookup
 pitch_to_note:
-    .byte 0,1,2,3,4            ; octave 0
-    .byte 0,1,2,3,4            ; octave 1
-    .byte 0,1,2,3,4            ; octave 2
-    .byte 0,1,2,3,4            ; octave 3
+    .byte 0,1,2,3,4            ; E G A B D
+    .byte 0,1,2,3,4
+    .byte 0,1,2,3,4
+    .byte 0,1,2,3,4
 pitch_to_octave:
     .byte 0,0,0,0,0
     .byte 1,1,1,1,1
     .byte 2,2,2,2,2
     .byte 3,3,3,3,3
+
+; PPU addresses for * channel indicators
+star_addr_hi: .byte $20, $20, $21, $21
+star_addr_lo: .byte $81, $C1, $01, $41
+
+; PPU addresses for grid starts (row, col 5)
+grid_addr_hi: .byte $20, $20, $21, $21
+grid_addr_lo: .byte $85, $C5, $05, $45
+
+; PPU addresses for > param indicators
+; PPU addresses for > param indicators (rows 13-17, col 1)
+pind_addr_hi: .byte $21, $21, $21, $22, $22
+pind_addr_lo: .byte $A1, $C1, $E1, $01, $21
+
+; SND preset name tiles (3 tiles per preset)
+snd_name_pulse:
+    .byte TILE_L, TILE_E, TILE_D   ; 0=Lead
+    .byte TILE_S, TILE_T, TILE_B   ; 1=Stab
+    .byte TILE_B, TILE_A, TILE_S   ; 2=Bass
+    .byte TILE_P, TILE_A, TILE_D   ; 3=Pad
+
+snd_name_tri:
+    .byte TILE_N, TILE_R, TILE_M   ; 0=Normal
+    .byte TILE_S, TILE_T, TILE_C   ; 1=Staccato
+
+snd_name_noise:
+    .byte TILE_K, TILE_C, TILE_K   ; 0=Kick
+    .byte TILE_S, TILE_N, TILE_R   ; 1=Snare
+    .byte TILE_H, TILE_T, TILE_C   ; 2=Hat Closed
+    .byte TILE_H, TILE_T, TILE_O   ; 3=Hat Open
+
+; WAV type name tiles (3 tiles per value)
+wav_name_pulse:
+    .byte TILE_S, TILE_Q, TILE_1   ; 0=SQ1 (12.5% duty)
+    .byte TILE_S, TILE_Q, TILE_2   ; 1=SQ2 (25% duty)
+    .byte TILE_S, TILE_Q, TILE_3   ; 2=SQ3 (50% duty)
+    .byte TILE_S, TILE_Q, TILE_4   ; 3=SQ4 (75% duty)
+
+wav_name_tri:
+    .byte TILE_T, TILE_R, TILE_I   ; 0=TRI
+
+wav_name_noise:
+    .byte TILE_L, TILE_N, TILE_G   ; 0=Long
+    .byte TILE_M, TILE_T, TILE_L   ; 1=Metallic
+
+; Speed table (frames per step, indexed 0-15 = SPD 01-16)
+speed_table:
+    .byte 60, 48, 40, 32, 26, 22, 18, 16
+    .byte 14, 12, 10, 8, 6, 4, 3, 2
+
+; Speed display tiles: tens digit (0 or 1)
+speed_tens_tile:
+    .byte TILE_EMPTY, TILE_EMPTY, TILE_EMPTY, TILE_EMPTY
+    .byte TILE_EMPTY, TILE_EMPTY, TILE_EMPTY, TILE_EMPTY
+    .byte TILE_EMPTY, TILE_1, TILE_1, TILE_1
+    .byte TILE_1, TILE_1, TILE_1, TILE_1
+
+; Speed display tiles: ones digit
+speed_ones_tile:
+    .byte TILE_1, TILE_2, TILE_3, TILE_4
+    .byte TILE_5, TILE_6, TILE_7, TILE_8
+    .byte TILE_9, TILE_0, TILE_1, TILE_2
+    .byte TILE_3, TILE_4, TILE_5, TILE_6
 
 ;------------------------------------------------------------------------------
 ; Vectors
@@ -1484,7 +1787,7 @@ pitch_to_octave:
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
-; Tiles 1-31: Pattern tiles (same as before)
+; Tiles 1-31: Pattern tiles
 .byte $00,$00,$00,$00,$00,$00,$00,$00  ; 1
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 .byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF  ; 2: Solid
@@ -1578,11 +1881,9 @@ pitch_to_octave:
 .byte $0C,$1C,$3C,$6C,$7E,$0C,$0C,$00
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
-; Tile 41: Solid color 2 (highlight/filled step)
+; Tile 41: Solid color 2 (filled step)
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 .byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
-
-; --- New tiles for v2 ---
 
 ; Tile 42: 'C'
 .byte $3C,$66,$60,$60,$60,$66,$3C,$00
@@ -1625,13 +1926,63 @@ pitch_to_octave:
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 .byte $00,$3C,$24,$24,$24,$3C,$00,$00
 
-; Tile 55: Cursor marker (up arrow, color 2)
-.byte $00,$00,$00,$00,$00,$00,$00,$00
+; Tile 55: Cursor marker (up arrow, color 1 = white)
 .byte $00,$18,$3C,$7E,$18,$18,$00,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; Tile 56: Hold/tie (horizontal bar, color 2)
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 .byte $00,$00,$00,$7E,$7E,$00,$00,$00
 
+; --- New tiles for v2 multi-channel display ---
+
+; Tile 57: Star/selection indicator (color 2 = channel color)
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $00,$00,$3C,$3C,$3C,$3C,$00,$00
+
+; Tile 58: 'H'
+.byte $66,$66,$66,$7E,$66,$66,$66,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 59: 'I'
+.byte $3C,$18,$18,$18,$18,$18,$3C,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 60: 'K'
+.byte $66,$6C,$78,$70,$78,$6C,$66,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 61: 'L'
+.byte $60,$60,$60,$60,$60,$60,$7E,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 62: 'M'
+.byte $C6,$EE,$FE,$D6,$C6,$C6,$C6,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 63: 'O'
+.byte $3C,$66,$66,$66,$66,$66,$3C,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 64: 'P'
+.byte $7C,$66,$66,$7C,$60,$60,$60,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 65: 'R'
+.byte $7C,$66,$66,$7C,$6C,$66,$66,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 66: 'T'
+.byte $7E,$18,$18,$18,$18,$18,$18,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 67: 'U'
+.byte $66,$66,$66,$66,$66,$66,$3C,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; Tile 68: '>' arrow indicator (color 1 = white)
+.byte $40,$60,$70,$78,$70,$60,$40,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+
 ; Fill remaining CHR space
-.res 8192 - (57 * 16), $00
+.res 8192 - (69 * 16), $00

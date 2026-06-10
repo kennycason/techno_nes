@@ -749,9 +749,9 @@ update_param_values:
     lda #$26
     sta PPU_ADDR
     ldx speed
-    lda speed_tens_tile, x
-    sta PPU_DATA
     lda speed_ones_tile, x
+    sta PPU_DATA
+    lda speed_tens_tile, x
     sta PPU_DATA
     lda #TILE_EMPTY
     sta PPU_DATA
@@ -852,37 +852,21 @@ write_wav_value:
 ; Write SEQ value (3 tiles: note+octave or drum name)
 ;------------------------------------------------------------------------------
 write_seq_value:
-    lda cur_channel
-    cmp #$03
-    beq @noise
-
-    ; Pitched: note letter + octave
-    ldx cur_pitch
-    lda pitch_to_note, x
-    clc
-    adc #TILE_E             ; note letter tile
+    lda cur_param
+    cmp #PARAM_SEQ
+    bne @blank
+    ; Show "EDT" when SEQ is selected
+    lda #TILE_E
     sta PPU_DATA
-    lda pitch_to_octave, x
-    clc
-    adc #TILE_1             ; octave digit tile
+    lda #TILE_D
     sta PPU_DATA
-    lda #TILE_EMPTY
+    lda #TILE_T
     sta PPU_DATA
     rts
-
-@noise:
-    ; Show drum type name
-    lda channel_snd+3
-    sta temp
-    asl a
-    clc
-    adc temp
-    tax
-    lda snd_name_noise, x
+@blank:
+    lda #TILE_EMPTY
     sta PPU_DATA
-    lda snd_name_noise+1, x
     sta PPU_DATA
-    lda snd_name_noise+2, x
     sta PPU_DATA
     rts
 
@@ -978,10 +962,13 @@ handle_input:
     ; --- A: record / preview ---
     jsr handle_a_button
 
-    ; --- B: clear current channel's segment ---
+    ; --- B: clear current channel's segment (SEQ mode only) ---
     lda buttons_new
     and #BTN_B
     beq @no_b
+    lda cur_param
+    cmp #PARAM_SEQ
+    bne @no_b
     jsr clear_channel_segment
     lda #$01
     sta display_dirty
@@ -1199,8 +1186,19 @@ handle_a_button:
     lda recording
     bne @already_rec
 
+    ; First frame of A press: toggle note
     lda #$01
     sta recording
+    jsr calc_seq_offset     ; X = offset
+    lda seq_data, x
+    beq @place_note         ; empty → place note
+    ; Already has a note → clear it
+    lda #$00
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+    rts
+@place_note:
     jsr write_note_at_cursor
     lda #$01
     sta display_dirty

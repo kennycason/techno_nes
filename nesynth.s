@@ -1788,12 +1788,13 @@ snd_tri_ctrl:
     .byte $81                  ; 3=PLS: ultra-short pulse
 
 ; Drum parameters (6 types)
+; NES noise: higher period = lower frequency. Bit 7 = metallic mode.
 drum_ctrl:
-    .byte $3F,$3C,$34,$37,$3B,$3E  ; kick/snare/hat-c/hat-o/tom/rim volume
+    .byte $3F,$3C,$34,$37,$3B,$3A  ; kick/snare/hat-c/hat-o/tom/rim volume
 drum_freq:
-    .byte $02,$06,$0F,$0E,$04,$0A  ; kick/snare/hat-c/hat-o/tom/rim pitch
+    .byte $0C,$06,$81,$81,$09,$83  ; kick(deep)/snare(crack)/hat-c(metal)/hat-o(metal)/tom(thump)/rim(metal)
 drum_len:
-    .byte $18,$10,$02,$06,$10,$08  ; kick/snare/hat-c/hat-o/tom/rim length
+    .byte $0C,$08,$02,$08,$0A,$04  ; kick/snare/hat-c/hat-o/tom/rim length
 
 ; Noise loop mode
 noise_loop:

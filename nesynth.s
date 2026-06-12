@@ -1,13 +1,21 @@
 ; NES SYNTH v2 - Channel-Based Step Sequencer
 ;
 ; Controls:
-;   Select      = Cycle channel (C1-C4: Pulse1, Pulse2, Triangle, Noise)
-;   Up/Down     = Cycle parameter (SND, WAV, NTE, SEQ, SEG, SPD, LCK)
-;   Left/Right  = Change current parameter value
-;   A           = Toggle note at cursor (hold=sustain)
-;   B           = Clear current channel's segment
-;   Start       = Play/pause sequencer
-;   LCK=YES     = Lock all editing (A/B/Select/L/R disabled except LCK)
+;   PLAY mode (default):
+;     Select      = Cycle channel (C1-C4: Pulse1, Pulse2, Triangle, Noise)
+;     Up/Down     = Cycle parameter (SND, WAV, SEQ, SEG, SPD, LCK)
+;     Left/Right  = Change current parameter value
+;     Start       = Enter EDIT mode
+;     LCK=YES     = Lock all editing
+;   EDIT mode:
+;     Left/Right  = Move edit cursor on grid
+;     Up/Down     = Change pitch at cursor (places note if empty)
+;     A (tap)     = Place/toggle note at cursor
+;     A + L/R     = Extend with hold markers
+;     B (tap)     = Clear step at cursor
+;     B + L/R     = Clear sweep
+;     Select      = Cycle channel
+;     Start       = Return to PLAY mode
 
 ;------------------------------------------------------------------------------
 ; Hardware Registers
@@ -58,12 +66,13 @@ MAX_PITCH   = 19
 
 PARAM_SND = 0
 PARAM_WAV = 1
-PARAM_NTE = 2
-PARAM_SEQ = 3
-PARAM_SEG = 4
-PARAM_SPD = 5
-PARAM_LCK = 6
-NUM_PARAMS = 7
+PARAM_SEQ = 2
+PARAM_SEG = 3
+PARAM_SPD = 4
+PARAM_LCK = 5
+NUM_PARAMS = 6
+
+TILE_WHITE    = 2    ; solid white block (for edit cursor flash)
 
 ; Tile indices
 TILE_EMPTY    = 0
@@ -117,20 +126,20 @@ buttons_cur:     .res 1
 buttons_prev:    .res 1
 buttons_new:     .res 1
 cur_channel:     .res 1      ; 0-3
-cur_param:       .res 1      ; 0-3
-cur_pitch:       .res 1      ; 0-19 (linear index into freq table)
-seq_cursor:      .res 1      ; 0-15
-seq_tick:        .res 1      ; 0-7
-seq_playing:     .res 1      ; 0=paused, 1=playing
+cur_param:       .res 1      ; 0-4
+seq_cursor:      .res 1      ; 0-15 (playback position)
+seq_tick:        .res 1
 global_seg:      .res 1      ; 0-3 (current segment)
 channel_snd:     .res 4      ; sound preset per channel
 channel_wav:     .res 4      ; waveform per channel
 last_played:     .res 4      ; last note index per channel ($FF=none)
-recording:       .res 1
 display_dirty:   .res 1
 speed:           .res 1      ; 0-15 (index into speed_table, displays as 1-16)
-seq_mode:        .res 1      ; 0=SEG (loop current), 1=ALL (auto-advance)
+seq_mode:        .res 1      ; 0=OFF, 1=SEG (loop), 2=ALL (auto-advance)
 locked:          .res 1      ; 0=NO, 1=YES (lock editing)
+edit_mode:       .res 1      ; 0=PLAY, 1=EDIT
+edit_cursor:     .res 1      ; 0-15 (edit position on grid)
+edit_pitch:      .res 1      ; last used pitch value (1-20 tonal, 1-6 noise)
 temp:            .res 1
 temp2:           .res 1
 
@@ -197,23 +206,16 @@ RESET:
     bpl @vblank2
 
     ; --- Initialize synth state ---
-    lda #$00
-    sta cur_channel
-    sta cur_param
-    sta seq_cursor
-    sta seq_tick
-    sta global_seg
-    sta recording
-    sta channel_snd
-    sta channel_snd+1
-    sta channel_snd+2
-    sta channel_snd+3
-    lda #$05                ; E3 = middle range
-    sta cur_pitch
+    ; Most ZP defaults to 0 from RAM clear:
+    ;   cur_channel, cur_param, seq_cursor, seq_tick, global_seg,
+    ;   channel_snd[4], edit_mode, edit_cursor, locked
 
     lda #$01
-    sta seq_playing
+    sta seq_mode            ; SEG mode (play on boot)
     sta display_dirty
+
+    lda #$06                ; E3 = default edit pitch
+    sta edit_pitch
 
     lda #$07                ; SPD 8 (16 frames/step, ~56 BPM)
     sta speed
@@ -296,6 +298,8 @@ NMI:
 
 @cursor_only:
     jsr update_cursor_row
+    jsr update_edit_cursor_flash
+    jsr update_nte_status
 @scroll_fixup:
     lda #%10000000
     sta PPU_CTRL
@@ -486,10 +490,10 @@ init_nametable:
     lda #TILE_V
     sta PPU_DATA
 
-    ; NTE (row 15, col 2-4 = $21E2)
+    ; NTE status label (row 12, col 2-4 = $2182) — not a param, display-only
     lda #$21
     sta PPU_ADDR
-    lda #$E2
+    lda #$82
     sta PPU_ADDR
     lda #TILE_N
     sta PPU_DATA
@@ -498,10 +502,10 @@ init_nametable:
     lda #TILE_E
     sta PPU_DATA
 
-    ; SEQ (row 16, col 2-4 = $2202)
-    lda #$22
+    ; SEQ (row 15, col 2-4 = $21E2)
+    lda #$21
     sta PPU_ADDR
-    lda #$02
+    lda #$E2
     sta PPU_ADDR
     lda #TILE_S
     sta PPU_DATA
@@ -510,10 +514,10 @@ init_nametable:
     lda #TILE_Q
     sta PPU_DATA
 
-    ; SEG (row 17, col 2-4 = $2222)
+    ; SEG (row 16, col 2-4 = $2202)
     lda #$22
     sta PPU_ADDR
-    lda #$22
+    lda #$02
     sta PPU_ADDR
     lda #TILE_S
     sta PPU_DATA
@@ -522,10 +526,10 @@ init_nametable:
     lda #TILE_G
     sta PPU_DATA
 
-    ; SPD (row 18, col 2-4 = $2242)
+    ; SPD (row 17, col 2-4 = $2222)
     lda #$22
     sta PPU_ADDR
-    lda #$42
+    lda #$22
     sta PPU_ADDR
     lda #TILE_S
     sta PPU_DATA
@@ -534,10 +538,10 @@ init_nametable:
     lda #TILE_D
     sta PPU_DATA
 
-    ; LCK (row 19, col 2-4 = $2262)
+    ; LCK (row 18, col 2-4 = $2242)
     lda #$22
     sta PPU_ADDR
-    lda #$62
+    lda #$42
     sta PPU_ADDR
     lda #TILE_L
     sta PPU_DATA
@@ -706,6 +710,129 @@ update_cursor_row_inner:
     rts
 
 ;------------------------------------------------------------------------------
+; Update edit cursor flash (one tile on the grid, called every frame)
+;------------------------------------------------------------------------------
+update_edit_cursor_flash:
+    lda edit_mode
+    beq @done
+
+    ldx cur_channel
+    lda grid_addr_hi, x
+    sta PPU_ADDR
+    lda grid_addr_lo, x
+    clc
+    adc edit_cursor
+    sta PPU_ADDR
+
+    lda frame_count
+    and #$08
+    bne @show_normal
+
+    lda #TILE_WHITE
+    sta PPU_DATA
+    rts
+
+@show_normal:
+    jsr calc_edit_offset
+    lda seq_data, x
+    beq @empty
+    cmp #$FF
+    beq @hold
+    lda #TILE_FILLED
+    jmp @write
+@empty:
+    lda #TILE_STEP_E
+    jmp @write
+@hold:
+    lda #TILE_HOLD
+@write:
+    sta PPU_DATA
+@done:
+    rts
+
+;------------------------------------------------------------------------------
+; Update NTE status display (row 12, col 6-8 = $2186)
+;------------------------------------------------------------------------------
+update_nte_status:
+    lda #$21
+    sta PPU_ADDR
+    lda #$86
+    sta PPU_ADDR
+
+    lda edit_mode
+    bne @use_edit
+    jsr calc_seq_offset
+    jmp @read_note
+@use_edit:
+    jsr calc_edit_offset
+@read_note:
+    lda seq_data, x
+    beq @show_empty
+    cmp #$FF
+    beq @show_empty
+
+    sec
+    sbc #$01
+    tax
+
+    lda cur_channel
+    cmp #$03
+    beq @noise_name
+
+    lda pitch_to_note, x
+    tay
+    lda note_tiles, y
+    sta PPU_DATA
+    lda pitch_to_octave, x
+    clc
+    adc #TILE_1
+    sta PPU_DATA
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    rts
+
+@noise_name:
+    txa
+    sta temp
+    asl a
+    clc
+    adc temp
+    tax
+    lda snd_name_noise, x
+    sta PPU_DATA
+    lda snd_name_noise+1, x
+    sta PPU_DATA
+    lda snd_name_noise+2, x
+    sta PPU_DATA
+    rts
+
+@show_empty:
+    lda #TILE_EMPTY
+    sta PPU_DATA
+    sta PPU_DATA
+    sta PPU_DATA
+    rts
+
+;------------------------------------------------------------------------------
+; Calculate edit cursor offset: channel_base + seg*16 + edit_cursor -> X
+;------------------------------------------------------------------------------
+calc_edit_offset:
+    ldx cur_channel
+    lda channel_base, x
+    sta temp
+    lda global_seg
+    asl a
+    asl a
+    asl a
+    asl a
+    clc
+    adc temp
+    clc
+    adc edit_cursor
+    tax
+    rts
+
+;------------------------------------------------------------------------------
 ; Update > param indicators
 ;------------------------------------------------------------------------------
 update_param_indicators:
@@ -746,24 +873,17 @@ update_param_values:
     sta PPU_ADDR
     jsr write_wav_value
 
-    ; NTE value at row 15, col 6 ($21E6)
+    ; SEQ value at row 15, col 6 ($21E6)
     lda #$21
     sta PPU_ADDR
     lda #$E6
     sta PPU_ADDR
-    jsr write_nte_value
+    jsr write_seq_mode_value
 
-    ; SEQ value at row 16, col 6 ($2206)
+    ; SEG value at row 16, col 6 ($2206)
     lda #$22
     sta PPU_ADDR
     lda #$06
-    sta PPU_ADDR
-    jsr write_seq_mode_value
-
-    ; SEG value at row 17, col 6 ($2226)
-    lda #$22
-    sta PPU_ADDR
-    lda #$26
     sta PPU_ADDR
     lda global_seg
     clc
@@ -773,10 +893,10 @@ update_param_values:
     sta PPU_DATA
     sta PPU_DATA
 
-    ; SPD value at row 18, col 6 ($2246)
+    ; SPD value at row 17, col 6 ($2226)
     lda #$22
     sta PPU_ADDR
-    lda #$46
+    lda #$26
     sta PPU_ADDR
     ldx speed
     lda speed_tens_tile, x
@@ -795,10 +915,10 @@ update_param_values:
     sta PPU_DATA
 @spd_done:
 
-    ; LCK value at row 19, col 6 ($2266)
+    ; LCK value at row 18, col 6 ($2246)
     lda #$22
     sta PPU_ADDR
-    lda #$66
+    lda #$46
     sta PPU_ADDR
     jsr write_lck_value
     rts
@@ -895,51 +1015,27 @@ write_wav_value:
     rts
 
 ;------------------------------------------------------------------------------
-; Write NTE value (3 tiles: note+octave or drum name)
-;------------------------------------------------------------------------------
-write_nte_value:
-    lda cur_channel
-    cmp #$03
-    beq @noise
-    ldx cur_pitch
-    lda pitch_to_note, x
-    tax
-    lda note_tiles, x
-    sta PPU_DATA
-    ldx cur_pitch
-    lda pitch_to_octave, x
-    clc
-    adc #TILE_1
-    sta PPU_DATA
-    lda #TILE_EMPTY
-    sta PPU_DATA
-    rts
-@noise:
-    lda channel_snd+3
-    sta temp
-    asl a
-    clc
-    adc temp
-    tax
-    lda snd_name_noise, x
-    sta PPU_DATA
-    lda snd_name_noise+1, x
-    sta PPU_DATA
-    lda snd_name_noise+2, x
-    sta PPU_DATA
-    rts
-
-;------------------------------------------------------------------------------
-; Write SEQ mode value (3 tiles: ALL or SEG)
+; Write SEQ mode value (3 tiles: OFF, SEG, or ALL)
 ;------------------------------------------------------------------------------
 write_seq_mode_value:
     lda seq_mode
-    bne @all
+    beq @off
+    cmp #$02
+    beq @all
+    ; SEG (1)
     lda #TILE_S
     sta PPU_DATA
     lda #TILE_E
     sta PPU_DATA
     lda #TILE_G
+    sta PPU_DATA
+    rts
+@off:
+    lda #TILE_O
+    sta PPU_DATA
+    lda #TILE_F
+    sta PPU_DATA
+    lda #TILE_F
     sta PPU_DATA
     rts
 @all:
@@ -1002,73 +1098,27 @@ handle_input:
     and buttons_cur
     sta buttons_new
 
-    ; --- Up: prev parameter (always works) ---
-    lda buttons_new
-    and #BTN_UP
-    beq @no_u
-    lda cur_param
-    bne @u_dec
-    lda #NUM_PARAMS
-@u_dec:
-    sec
-    sbc #$01
-    sta cur_param
-    lda #$01
-    sta display_dirty
-@no_u:
-
-    ; --- Down: next parameter (always works) ---
-    lda buttons_new
-    and #BTN_DOWN
-    beq @no_d
-    inc cur_param
-    lda cur_param
-    cmp #NUM_PARAMS
-    bcc @d_ok
-    lda #$00
-    sta cur_param
-@d_ok:
-    lda #$01
-    sta display_dirty
-@no_d:
-
-    ; --- Start: play/pause (always works) ---
+    ; --- START: toggle PLAY/EDIT mode ---
     lda buttons_new
     and #BTN_START
     beq @no_st
-    lda seq_playing
+    lda locked
+    bne @no_st              ; can't enter edit mode when locked
+    lda edit_mode
     eor #$01
-    sta seq_playing
+    sta edit_mode
+    beq @st_dirty
+    ; Entering edit mode: snap edit cursor to play cursor
+    lda seq_cursor
+    sta edit_cursor
+@st_dirty:
     lda #$01
     sta display_dirty
 @no_st:
 
-    ; --- Lock check: if locked, only allow L/R on LCK param ---
+    ; --- SELECT: cycle channel (unless locked) ---
     lda locked
-    beq @unlocked
-
-    ; Locked: only Left/Right on PARAM_LCK
-    lda cur_param
-    cmp #PARAM_LCK
-    bne @done_locked
-    lda buttons_new
-    and #BTN_RIGHT
-    beq @lck_no_r
-    jsr param_up
-    lda #$01
-    sta display_dirty
-@lck_no_r:
-    lda buttons_new
-    and #BTN_LEFT
-    beq @done_locked
-    jsr param_down
-    lda #$01
-    sta display_dirty
-@done_locked:
-    rts
-
-@unlocked:
-    ; --- Select: cycle channel ---
+    bne @no_sel
     lda buttons_new
     and #BTN_SELECT
     beq @no_sel
@@ -1080,36 +1130,373 @@ handle_input:
     sta display_dirty
 @no_sel:
 
-    ; --- Right: increase value ---
+    ; Branch: EDIT or PLAY mode
+    lda edit_mode
+    bne handle_edit_input
+    ; Fall through to PLAY mode
+
+    ; ============ PLAY MODE ============
+    ; Lock check for L/R
+    lda locked
+    beq @play_unlocked
+
+    ; Locked: only L/R on PARAM_LCK
+    lda cur_param
+    cmp #PARAM_LCK
+    bne @play_updown
     lda buttons_new
     and #BTN_RIGHT
-    beq @no_r
+    beq @plck_no_r
     jsr param_up
     lda #$01
     sta display_dirty
-@no_r:
-
-    ; --- Left: decrease value ---
+@plck_no_r:
     lda buttons_new
     and #BTN_LEFT
-    beq @no_l
+    beq @play_updown
     jsr param_down
     lda #$01
     sta display_dirty
-@no_l:
+    jmp @play_updown
 
-    ; --- A: toggle note at cursor (always) ---
-    jsr handle_a_button
-
-    ; --- B: clear current channel's segment ---
+@play_unlocked:
+    ; Right: increase param value
     lda buttons_new
-    and #BTN_B
-    beq @no_b
-    jsr clear_channel_segment
+    and #BTN_RIGHT
+    beq @play_no_r
+    jsr param_up
     lda #$01
     sta display_dirty
-@no_b:
+@play_no_r:
+    ; Left: decrease param value
+    lda buttons_new
+    and #BTN_LEFT
+    beq @play_updown
+    jsr param_down
+    lda #$01
+    sta display_dirty
 
+@play_updown:
+    ; Up: prev parameter
+    lda buttons_new
+    and #BTN_UP
+    beq @play_no_u
+    lda cur_param
+    bne @pu_dec
+    lda #NUM_PARAMS
+@pu_dec:
+    sec
+    sbc #$01
+    sta cur_param
+    lda #$01
+    sta display_dirty
+@play_no_u:
+    ; Down: next parameter
+    lda buttons_new
+    and #BTN_DOWN
+    beq @play_no_d
+    inc cur_param
+    lda cur_param
+    cmp #NUM_PARAMS
+    bcc @pd_ok
+    lda #$00
+    sta cur_param
+@pd_ok:
+    lda #$01
+    sta display_dirty
+@play_no_d:
+    rts
+
+    ; ============ EDIT MODE ============
+handle_edit_input:
+    ; Check A held (place/extend)
+    lda buttons_cur
+    and #BTN_A
+    bne @a_held
+
+    ; Check B held (clear)
+    lda buttons_cur
+    and #BTN_B
+    beq @no_b_held
+    jmp @b_held
+@no_b_held:
+
+    ; --- Normal cursor movement ---
+    lda buttons_new
+    and #BTN_RIGHT
+    beq @ed_no_r
+    inc edit_cursor
+    lda edit_cursor
+    and #$0F
+    sta edit_cursor
+    lda #$01
+    sta display_dirty
+@ed_no_r:
+    lda buttons_new
+    and #BTN_LEFT
+    beq @ed_updown
+    lda edit_cursor
+    bne @ed_l_dec
+    lda #$10
+@ed_l_dec:
+    sec
+    sbc #$01
+    sta edit_cursor
+    lda #$01
+    sta display_dirty
+
+@ed_updown:
+    ; Up/Down: change pitch at edit cursor
+    lda buttons_new
+    and #BTN_UP
+    beq @ed_no_u
+    jsr edit_pitch_up
+    lda #$01
+    sta display_dirty
+@ed_no_u:
+    lda buttons_new
+    and #BTN_DOWN
+    beq @ed_no_d
+    jsr edit_pitch_down
+    lda #$01
+    sta display_dirty
+@ed_no_d:
+    rts
+
+@a_held:
+    ; First frame of A: place note (or toggle off)
+    lda buttons_new
+    and #BTN_A
+    beq @a_extend
+    jsr calc_edit_offset
+    lda seq_data, x
+    beq @a_place
+    cmp #$FF
+    beq @a_place
+    ; Note exists → clear it
+    lda #$00
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+    rts
+@a_place:
+    ; Place note at edit_pitch
+    lda edit_pitch
+    ldx cur_channel
+    cpx #$03
+    bne @a_clamp_tonal
+    ; Noise: clamp 1-6
+    cmp #$07
+    bcc @a_pitch_ok
+    lda #$01
+    jmp @a_pitch_ok
+@a_clamp_tonal:
+    cmp #$15
+    bcc @a_pitch_ok
+    lda #$06
+@a_pitch_ok:
+    cmp #$01
+    bcs @a_store
+    lda #$06                ; default E3
+@a_store:
+    sta edit_pitch
+    jsr calc_edit_offset
+    lda edit_pitch
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+    rts
+
+@a_extend:
+    ; A held + movement: extend with hold markers
+    lda buttons_new
+    and #BTN_RIGHT
+    beq @ae_no_r
+    inc edit_cursor
+    lda edit_cursor
+    and #$0F
+    sta edit_cursor
+    jsr calc_edit_offset
+    lda #$FF
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+@ae_no_r:
+    lda buttons_new
+    and #BTN_LEFT
+    beq @ae_ud
+    lda edit_cursor
+    bne @ae_l_dec
+    lda #$10
+@ae_l_dec:
+    sec
+    sbc #$01
+    sta edit_cursor
+    jsr calc_edit_offset
+    lda #$FF
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+@ae_ud:
+    ; Up/Down while A held: change pitch (no extend)
+    lda buttons_new
+    and #BTN_UP
+    beq @ae_no_u
+    jsr edit_pitch_up
+    lda #$01
+    sta display_dirty
+@ae_no_u:
+    lda buttons_new
+    and #BTN_DOWN
+    beq @ae_no_d
+    jsr edit_pitch_down
+    lda #$01
+    sta display_dirty
+@ae_no_d:
+    rts
+
+@b_held:
+    ; First frame of B: clear current step
+    lda buttons_new
+    and #BTN_B
+    beq @b_move
+    jsr calc_edit_offset
+    lda #$00
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+    rts
+@b_move:
+    ; B held + movement: clear as you go
+    lda buttons_new
+    and #BTN_RIGHT
+    beq @bm_no_r
+    inc edit_cursor
+    lda edit_cursor
+    and #$0F
+    sta edit_cursor
+    jsr calc_edit_offset
+    lda #$00
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+@bm_no_r:
+    lda buttons_new
+    and #BTN_LEFT
+    beq @bm_done
+    lda edit_cursor
+    bne @bm_l_dec
+    lda #$10
+@bm_l_dec:
+    sec
+    sbc #$01
+    sta edit_cursor
+    jsr calc_edit_offset
+    lda #$00
+    sta seq_data, x
+    lda #$01
+    sta display_dirty
+@bm_done:
+    rts
+
+;------------------------------------------------------------------------------
+; Edit pitch up — increment note at edit cursor (or place new)
+;------------------------------------------------------------------------------
+edit_pitch_up:
+    jsr calc_edit_offset
+    lda seq_data, x
+    beq @done
+    cmp #$FF
+    beq @done
+
+    sta temp
+    stx temp2
+
+    lda cur_channel
+    cmp #$03
+    beq @noise_up
+    lda temp
+    cmp #$14
+    bcc @inc_t
+    lda #$00
+@inc_t:
+    clc
+    adc #$01
+    jmp @store
+
+@noise_up:
+    lda temp
+    cmp #$06
+    bcc @inc_n
+    lda #$00
+@inc_n:
+    clc
+    adc #$01
+    jmp @store
+
+@done:
+    rts
+
+@store:
+    sta edit_pitch
+    ldx temp2
+    sta seq_data, x
+    rts
+
+;------------------------------------------------------------------------------
+; Edit pitch down — decrement note at edit cursor (or place new)
+;------------------------------------------------------------------------------
+edit_pitch_down:
+    jsr calc_edit_offset
+    lda seq_data, x
+    beq @done
+    cmp #$FF
+    beq @done
+
+    sta temp
+    stx temp2
+
+    lda cur_channel
+    cmp #$03
+    beq @noise_dn
+    lda temp
+    cmp #$02
+    bcs @dec_t
+    lda #$15
+@dec_t:
+    sec
+    sbc #$01
+    jmp @store
+
+@noise_dn:
+    lda temp
+    cmp #$02
+    bcs @dec_n
+    lda #$07
+@dec_n:
+    sec
+    sbc #$01
+    jmp @store
+
+@done:
+    rts
+
+@store:
+    sta edit_pitch
+    ldx temp2
+    sta seq_data, x
+    rts
+
+;------------------------------------------------------------------------------
+; Silence all APU channels
+;------------------------------------------------------------------------------
+silence_all:
+    lda #$30
+    sta APU_PULSE1_CTRL
+    sta APU_PULSE2_CTRL
+    sta APU_NOISE_CTRL
+    lda #$80
+    sta APU_TRI_CTRL
     rts
 
 ;------------------------------------------------------------------------------
@@ -1121,8 +1508,6 @@ param_up:
     beq @snd
     cmp #PARAM_WAV
     beq @wav
-    cmp #PARAM_NTE
-    beq @pitch
     cmp #PARAM_SEQ
     beq @seq
     cmp #PARAM_SEG
@@ -1136,9 +1521,16 @@ param_up:
     rts
 
 @seq:
+    inc seq_mode
     lda seq_mode
-    eor #$01
+    cmp #$03
+    bcc @seq_ok
+    lda #$00
     sta seq_mode
+@seq_ok:
+    lda seq_mode
+    bne @done
+    jsr silence_all     ; switched to OFF
     rts
 
 @seg:
@@ -1199,22 +1591,6 @@ param_up:
     bcc @done
     lda #$00
     sta channel_wav, x
-    rts
-
-@pitch:
-    lda cur_channel
-    cmp #$03
-    beq @noise_pitch
-    lda cur_pitch
-    cmp #MAX_PITCH
-    bcs @done
-    inc cur_pitch
-    rts
-@noise_pitch:
-    lda channel_snd+3
-    cmp #$05            ; 6 drum types (0-5)
-    bcs @done
-    inc channel_snd+3
 @done:
     rts
 
@@ -1227,8 +1603,6 @@ param_down:
     beq @snd
     cmp #PARAM_WAV
     beq @wav
-    cmp #PARAM_NTE
-    beq @pitch
     cmp #PARAM_SEQ
     beq @seq
     cmp #PARAM_SEG
@@ -1243,8 +1617,15 @@ param_down:
 
 @seq:
     lda seq_mode
-    eor #$01
+    bne @seq_dec
+    lda #$02
     sta seq_mode
+    rts
+@seq_dec:
+    dec seq_mode
+    lda seq_mode
+    bne @done
+    jsr silence_all     ; switched to OFF
     rts
 
 @seg:
@@ -1299,93 +1680,7 @@ param_down:
     rts
 @wav_dec:
     dec channel_wav, x
-    rts
-
-@pitch:
-    lda cur_channel
-    cmp #$03
-    beq @noise_pitch
-    lda cur_pitch
-    beq @done
-    dec cur_pitch
-    rts
-@noise_pitch:
-    lda channel_snd+3
-    beq @done
-    dec channel_snd+3
 @done:
-    rts
-
-;------------------------------------------------------------------------------
-; Handle A button - toggle note at cursor (always active)
-;------------------------------------------------------------------------------
-handle_a_button:
-    lda buttons_cur
-    and #BTN_A
-    beq @a_released
-
-    lda recording
-    bne @already_rec
-
-    ; First frame of A press: toggle note
-    lda #$01
-    sta recording
-    jsr calc_seq_offset     ; X = offset
-    lda seq_data, x
-    beq @place_note         ; empty → place note
-    ; Already has a note → clear it
-    lda #$00
-    sta seq_data, x
-    lda #$01
-    sta display_dirty
-    rts
-@place_note:
-    jsr write_note_at_cursor
-    lda #$01
-    sta display_dirty
-    rts
-
-@already_rec:
-    lda seq_tick
-    bne @done
-    jsr write_hold_at_cursor
-    lda #$01
-    sta display_dirty
-@done:
-    rts
-
-@a_released:
-    lda #$00
-    sta recording
-    rts
-
-;------------------------------------------------------------------------------
-; Write note at cursor position
-;------------------------------------------------------------------------------
-write_note_at_cursor:
-    jsr calc_seq_offset
-    lda cur_channel
-    cmp #$03
-    beq @drum
-    lda cur_pitch
-    clc
-    adc #$01
-    sta seq_data, x
-    rts
-@drum:
-    lda channel_snd+3
-    clc
-    adc #$01
-    sta seq_data, x
-    rts
-
-;------------------------------------------------------------------------------
-; Write hold marker at cursor position
-;------------------------------------------------------------------------------
-write_hold_at_cursor:
-    jsr calc_seq_offset
-    lda #$FF
-    sta seq_data, x
     rts
 
 ;------------------------------------------------------------------------------
@@ -1446,7 +1741,7 @@ calc_seg_base:
 ; Update sound - sequencer tick + playback
 ;------------------------------------------------------------------------------
 update_sound:
-    lda seq_playing
+    lda seq_mode
     beq @done
 
     inc seq_tick
@@ -1466,9 +1761,10 @@ update_sound:
     lda #$00
     sta seq_cursor
 
-    ; Cursor wrapped — check SEQ mode for auto-advance
+    ; Cursor wrapped — only advance segment in ALL mode
     lda seq_mode
-    beq @play               ; SEG mode: just loop
+    cmp #$02
+    bne @play               ; SEG or OFF: just loop
     jsr advance_segment
     lda #$01
     sta display_dirty
@@ -1824,9 +2120,9 @@ star_addr_lo: .byte $81, $C1, $01, $41
 grid_addr_hi: .byte $20, $20, $21, $21
 grid_addr_lo: .byte $85, $C5, $05, $45
 
-; PPU addresses for > param indicators (rows 13-19, col 1)
-pind_addr_hi: .byte $21, $21, $21, $22, $22, $22, $22
-pind_addr_lo: .byte $A1, $C1, $E1, $01, $21, $41, $61
+; PPU addresses for > param indicators (rows 13-18, col 1)
+pind_addr_hi: .byte $21, $21, $21, $22, $22, $22
+pind_addr_lo: .byte $A1, $C1, $E1, $01, $21, $41
 
 ; SND preset name tiles (3 tiles per preset)
 snd_name_pulse:
